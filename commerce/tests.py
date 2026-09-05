@@ -11,7 +11,7 @@ from PIL import Image
 from rest_framework.test import APIClient
 
 from .importers.validators import TEMPLATE_COLUMNS
-from .models import Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Inventory, Order, Product, ProductImportJob, ProductImage, ProductVariant
+from .models import Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Inventory, NewsletterSubscriber, Order, Product, ProductImportJob, ProductImage, ProductVariant
 
 
 class CommerceApiTests(TestCase):
@@ -45,13 +45,52 @@ class CommerceApiTests(TestCase):
     def login(self, user):
         self.client.force_authenticate(user=user)
 
-    def test_customer_registration_disabled_and_admin_login_works(self):
+    def test_customer_registration_and_admin_login_work(self):
         response = self.client.post("/api/v1/auth/register/", {"email": "new@test.local", "username": "new", "password": "Password123!", "first_name": "New", "last_name": "Client"})
-        self.assertEqual(response.status_code, 403)
-        self.assertFalse(get_user_model().objects.filter(email="new@test.local").exists())
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(get_user_model().objects.filter(email="new@test.local", role=get_user_model().Role.CUSTOMER).exists())
+        self.assertIn("access", response.data)
         response = self.client.post("/api/v1/auth/login/", {"email": "admin@test.local", "password": "Password123!"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("access", response.data)
+
+    def test_newsletter_subscription_is_idempotent(self):
+        payload = {"email": "client@example.com"}
+        self.assertEqual(self.client.post("/api/v1/newsletter/subscribe/", payload).status_code, 201)
+        self.assertEqual(self.client.post("/api/v1/newsletter/subscribe/", payload).status_code, 201)
+        self.assertEqual(NewsletterSubscriber.objects.filter(email="client@example.com", is_active=True).count(), 1)
+
+    def test_customer_can_only_list_their_orders(self):
+        mine = Order.objects.create(
+            user=self.customer,
+            payment_method=Order.PaymentMethod.COD,
+            delivery_zone=self.zone,
+            shipping_full_name="Client",
+            shipping_phone="+212612345678",
+            shipping_address="Adresse",
+            shipping_city="Casablanca",
+            subtotal=Decimal("100.00"),
+            shipping_total=Decimal("25.00"),
+            total=Decimal("125.00"),
+        )
+        other = get_user_model().objects.create_user(email="other@test.local", username="other", password="Password123!")
+        Order.objects.create(
+            user=other,
+            payment_method=Order.PaymentMethod.COD,
+            delivery_zone=self.zone,
+            shipping_full_name="Autre",
+            shipping_phone="+212612345679",
+            shipping_address="Adresse",
+            shipping_city="Casablanca",
+            subtotal=Decimal("90.00"),
+            shipping_total=Decimal("25.00"),
+            total=Decimal("115.00"),
+        )
+        self.login(self.customer)
+        response = self.client.get("/api/v1/orders/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], mine.id)
 
     def test_customer_cannot_create_category(self):
         self.login(self.customer)

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import timedelta
 
 from django.core.mail import send_mail
 from django.db import transaction
@@ -141,7 +142,7 @@ def checkout(user, cart, data):
     address = None
     if data.get("address_id"):
         if not customer_user:
-            raise ValidationError({"address_id": "Les adresses enregistrees sont reservees aux comptes admin."})
+            raise ValidationError({"address_id": "Connectez-vous pour utiliser une adresse enregistree."})
         address = CustomerAddress.objects.get(pk=data["address_id"], user=customer_user)
     else:
         missing = [field for field in ("shipping_full_name", "shipping_phone", "shipping_address") if not data.get(field)]
@@ -229,6 +230,13 @@ def dashboard_metrics():
     month_revenue = delivered.filter(updated_at__date__gte=month_start).aggregate(total=Sum("total"))["total"] or Decimal("0.00")
     total_orders = Order.objects.count()
     revenue = delivered.aggregate(total=Sum("total"))["total"] or Decimal("0.00")
+    sales_by_day = [
+        {
+            "day": (today - timedelta(days=offset)).isoformat(),
+            "sales": delivered.filter(updated_at__date=today - timedelta(days=offset)).aggregate(total=Sum("total"))["total"] or Decimal("0.00"),
+        }
+        for offset in range(6, -1, -1)
+    ]
     return {
         "revenue_today": today_revenue,
         "revenue_month": month_revenue,
@@ -239,4 +247,5 @@ def dashboard_metrics():
         "average_order_value": revenue / total_orders if total_orders else Decimal("0.00"),
         "low_stock_products": Inventory.objects.filter(quantity__lte=F("variant__product__low_stock_threshold")).count(),
         "out_of_stock_products": Inventory.objects.filter(quantity=0).count(),
+        "sales_by_day": sales_by_day,
     }

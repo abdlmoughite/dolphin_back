@@ -16,6 +16,7 @@ from .models import (
     DeliveryZone,
     HomepageBanner,
     Inventory,
+    NewsletterSubscriber,
     Order,
     OrderItem,
     OrderStatusHistory,
@@ -102,6 +103,16 @@ class DeveloperUserSerializer(serializers.ModelSerializer):
             instance.is_staff = True
         instance.save()
         return instance
+
+
+class AdminCustomerSerializer(serializers.ModelSerializer):
+    order_count = serializers.IntegerField(read_only=True, default=0)
+    total_spent = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, default=0)
+
+    class Meta:
+        model = get_user_model()
+        fields = ["id", "email", "username", "first_name", "last_name", "phone", "status", "date_joined", "order_count", "total_spent"]
+        read_only_fields = ["email", "username", "first_name", "last_name", "phone", "date_joined", "order_count", "total_spent"]
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -499,6 +510,23 @@ class HomepageBannerSerializer(serializers.ModelSerializer):
     class Meta:
         model = HomepageBanner
         fields = "__all__"
+
+
+class NewsletterSubscriberSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NewsletterSubscriber
+        fields = ["email"]
+        extra_kwargs = {"email": {"validators": []}}
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+    def create(self, validated_data):
+        subscriber, _ = NewsletterSubscriber.objects.update_or_create(
+            email=validated_data["email"],
+            defaults={"is_active": True},
+        )
+        return subscriber
 
 
 class AuditLogSerializer(serializers.ModelSerializer):
