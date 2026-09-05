@@ -51,6 +51,7 @@ from .importers.services import commit_import, preview_import
 from .permissions import CanManageUsers, IsAdminRole, IsCatalogManagerOrReadOnly, IsDeveloper, IsOrderManager
 from .serializers import (
     AdminProductWriteSerializer,
+    AdminCustomerSerializer,
     AuditLogSerializer,
     BrandSerializer,
     CartItemSerializer,
@@ -65,6 +66,7 @@ from .serializers import (
     DeveloperUserSerializer,
     DolphinTokenObtainPairSerializer,
     HomepageBannerSerializer,
+    NewsletterSubscriberSerializer,
     OrderSerializer,
     ProductReviewSerializer,
     ProductSerializer,
@@ -120,7 +122,18 @@ class RegisterView(APIView):
     throttle_scope = "auth"
 
     def post(self, request):
-        return Response({"detail": "Les comptes client sont desactives. Commandez sans compte; seuls les comptes admin et equipe sont autorises."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        refresh = RefreshToken.for_user(user)
+        return Response(
+            {
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+                "user": UserSerializer(user).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class MeView(APIView):
@@ -405,8 +418,19 @@ class CartViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["patch"])
     def update_item(self, request):
         cart = get_or_create_cart(request)
-        item = cart.items.get(pk=request.data["item_id"])
-        item.quantity = max(int(request.data.get("quantity", 1)), 1)
+        try:
+            quantity = int(request.data.get("quantity", 1))
+        except (TypeError, ValueError):
+            return Response({"quantity": "Quantite invalide."}, status=400)
+        if quantity < 1:
+            return Response({"quantity": "La quantite doit etre superieure a zero."}, status=400)
+        try:
+            item = cart.items.select_related("variant__inventory").get(pk=request.data.get("item_id"))
+        except CartItem.DoesNotExist:
+            return Response({"detail": "Article introuvable dans ce panier."}, status=404)
+        if item.variant.inventory.available_quantity < quantity:
+            return Response({"quantity": "Stock insuffisant pour cette quantite."}, status=400)
+        item.quantity = quantity
         item.save(update_fields=["quantity"])
         return Response(CartItemSerializer(item).data)
 
@@ -436,13 +460,19 @@ class CheckoutView(APIView):
 
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
-    permission_classes = [IsOrderManager]
     search_fields = ["order_number", "user__email", "guest_email", "shipping_phone", "tracking_number"]
     filterset_fields = ["status", "payment_method", "shipping_city"]
     ordering_fields = ["created_at", "total"]
 
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            return [IsAuthenticated()]
+        return [IsOrderManager()]
+
     def get_queryset(self):
         qs = Order.objects.prefetch_related("items", "status_history")
+        if self.request.user.role == User.Role.CUSTOMER:
+            qs = qs.filter(user=self.request.user)
         return qs
 
     def update(self, request, *args, **kwargs):
@@ -523,6 +553,11 @@ class AddressViewSet(viewsets.ModelViewSet):
         if serializer.validated_data.get("is_default"):
             self.request.user.addresses.update(is_default=False)
         serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        if serializer.validated_data.get("is_default"):
+            self.request.user.addresses.exclude(pk=serializer.instance.pk).update(is_default=False)
+        serializer.save()
 
 
 class WishlistViewSet(viewsets.ModelViewSet):
@@ -621,6 +656,16 @@ class HomepageBannerViewSet(viewsets.ModelViewSet):
     permission_classes = [IsCatalogManagerOrReadOnly]
 
 
+class NewsletterSubscribeView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = NewsletterSubscriberSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({"detail": "Inscription a la newsletter confirmee."}, status=status.HTTP_201_CREATED)
+
+
 class AdminDashboardView(APIView):
     permission_classes = [IsAdminRole]
 
@@ -664,6 +709,36 @@ class StaffViewSet(viewsets.ModelViewSet):
         user.delete()
         AuditLog.objects.create(actor=request.user, action="USER_DELETED", entity="User", entity_id=str(user.pk), before=before, ip_address=client_ip(request))
         return Response(status=204)
+
+
+class AdminCustomerViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = AdminCustomerSerializer
+    permission_classes = [IsAdminRole]
+    search_fields = ["email", "username", "first_name", "last_name", "phone"]
+    filterset_fields = ["status"]
+    ordering_fields = ["date_joined", "email"]
+
+    def get_queryset(self):
+        return get_user_model().objects.filter(role=User.Role.CUSTOMER).annotate(
+            order_count=Count("orders", distinct=True),
+            total_spent=Sum("orders__total"),
+        ).order_by("-date_joined")
+
+    @action(detail=True, methods=["patch"])
+    def status(self, request, pk=None):
+        customer = self.get_object()
+        serializer = self.get_serializer(customer, data={"status": request.data.get("status")}, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        AuditLog.objects.create(
+            actor=request.user,
+            action="CUSTOMER_STATUS_UPDATED",
+            entity="User",
+            entity_id=str(customer.pk),
+            after={"status": customer.status},
+            ip_address=client_ip(request),
+        )
+        return Response(serializer.data)
 
 
 class DeveloperDashboardView(APIView):

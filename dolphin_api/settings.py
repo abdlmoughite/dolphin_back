@@ -66,7 +66,7 @@ def required_env(name, allow_blank=False):
     try:
         value = config(name, default="") if allow_blank else config(name)
     except UndefinedValueError as exc:
-        raise ImproperlyConfigured(f"Variable d'environnement manquante: {name}. Copiez backend/env.example vers backend/.env puis configurez XAMPP MySQL.") from exc
+        raise ImproperlyConfigured(f"Variable d'environnement manquante: {name}. Copiez .env.example vers .env puis configurez XAMPP MySQL.") from exc
     if not allow_blank and value == "":
         raise ImproperlyConfigured(f"Variable d'environnement vide: {name}. Configurez backend/.env pour XAMPP MySQL.")
     return value

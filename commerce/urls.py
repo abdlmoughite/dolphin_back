@@ -5,6 +5,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     AddressViewSet,
     AdminDashboardView,
+    AdminCustomerViewSet,
     AuditLogViewSet,
     BrandViewSet,
     CartViewSet,
@@ -22,6 +23,7 @@ from .views import (
     LogoutView,
     MeView,
     NotificationViewSet,
+    NewsletterSubscribeView,
     OrderViewSet,
     PasswordResetRequestView,
     ProductViewSet,
@@ -53,6 +55,7 @@ router.register("support", SupportTicketViewSet, basename="support")
 router.register("returns", ReturnRequestViewSet, basename="return")
 router.register("banners", HomepageBannerViewSet, basename="banner")
 router.register("admin/staff", StaffViewSet, basename="staff")
+router.register("admin/customers", AdminCustomerViewSet, basename="admin-customer")
 router.register("developer/audit-logs", AuditLogViewSet, basename="developer-audit-log")
 
 urlpatterns = [
@@ -65,6 +68,7 @@ urlpatterns = [
     path("auth/password/reset/", PasswordResetRequestView.as_view()),
     path("auth/me/", MeView.as_view()),
     path("checkout/", CheckoutView.as_view()),
+    path("newsletter/subscribe/", NewsletterSubscribeView.as_view()),
     path("admin/dashboard/", AdminDashboardView.as_view()),
     path("developer/dashboard/", DeveloperDashboardView.as_view()),
     path("developer/system/", DeveloperSystemView.as_view()),
