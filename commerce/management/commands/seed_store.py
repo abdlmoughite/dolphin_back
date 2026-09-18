@@ -544,7 +544,7 @@ class Command(BaseCommand):
             subtotal = product_a.current_price * qty_a + product_b.current_price * qty_b
             coupon = coupons["WELCOME10"] if index % 5 == 0 else None
             discount = (subtotal * Decimal("0.10")).quantize(Decimal("0.01")) if coupon else Decimal("0.00")
-            shipping = Decimal("0.00") if subtotal >= (zone.free_delivery_threshold or Decimal("999999.00")) else zone.shipping_price
+            shipping = Decimal("0.00")
             total = subtotal - discount + shipping
             status = statuses[index % len(statuses)]
             order, _ = Order.objects.update_or_create(

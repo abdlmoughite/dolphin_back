@@ -1,15 +1,20 @@
 import csv
 import platform
 import sys
+from decimal import Decimal
 from datetime import timedelta
+from io import BytesIO
 
 import django
+from openpyxl import Workbook
 from PIL import Image
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
-from django.db import connection
+from django.db import connection, transaction
+from django.db.models import F
 from django.db.models import Avg, Count, Q, Sum
+from django.db.models.deletion import ProtectedError
 from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import FilterSet, NumberFilter
@@ -31,8 +36,10 @@ from .models import (
     CustomerAddress,
     CustomerNotification,
     DeliveryZone,
+    Expense,
     HomepageBanner,
     Inventory,
+    NewsletterSubscriber,
     Order,
     Product,
     ProductImage,
@@ -40,7 +47,11 @@ from .models import (
     ProductImportJob,
     ProductReview,
     Promotion,
+    Refund,
+    ReturnHistory,
     ReturnRequest,
+    StockMovement,
+    Supplier,
     SupportTicket,
     User,
     Wishlist,
@@ -48,7 +59,7 @@ from .models import (
 )
 from .importers.excel_importer import build_template_workbook
 from .importers.services import commit_import, preview_import
-from .permissions import CanManageUsers, IsAdminRole, IsCatalogManagerOrReadOnly, IsDeveloper, IsOrderManager
+from .permissions import CanManageUsers, IsAdminRole, IsCatalogManagerOrReadOnly, IsDeveloper, IsOrderManager, IsOrderManagerOrCustomer
 from .serializers import (
     AdminProductWriteSerializer,
     AuditLogSerializer,
@@ -64,7 +75,10 @@ from .serializers import (
     DeliveryZoneSerializer,
     DeveloperUserSerializer,
     DolphinTokenObtainPairSerializer,
+    ExpenseSerializer,
+    RefundSerializer,
     HomepageBannerSerializer,
+    NewsletterSubscriberSerializer,
     OrderSerializer,
     ProductReviewSerializer,
     ProductSerializer,
@@ -72,6 +86,7 @@ from .serializers import (
     PromotionSerializer,
     RegisterSerializer,
     ReturnRequestSerializer,
+    SupplierSerializer,
     SupportTicketSerializer,
     UserSerializer,
     WishlistItemSerializer,
@@ -92,6 +107,37 @@ def client_ip(request):
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.META.get("REMOTE_ADDR")
+
+
+def simple_pdf_response(filename, lines):
+    escaped_lines = [str(line).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") for line in lines]
+    text_commands = ["BT", "/F1 12 Tf", "50 790 Td"]
+    for index, line in enumerate(escaped_lines):
+        if index:
+            text_commands.append("0 -18 Td")
+        text_commands.append(f"({line}) Tj")
+    text_commands.append("ET")
+    stream = "\n".join(text_commands).encode("latin-1", errors="replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    body = b"%PDF-1.4\n"
+    offsets = [0]
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(body))
+        body += f"{number} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_start = len(body)
+    body += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for offset in offsets[1:]:
+        body += f"{offset:010d} 00000 n \n".encode()
+    body += f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode()
+    response = HttpResponse(body, content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 class DolphinTokenObtainPairView(TokenObtainPairView):
@@ -120,7 +166,12 @@ class RegisterView(APIView):
     throttle_scope = "auth"
 
     def post(self, request):
-        return Response({"detail": "Les comptes client sont desactives. Commandez sans compte; seuls les comptes admin et equipe sont autorises."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        AuditLog.objects.create(actor=user, action="CUSTOMER_REGISTERED", entity="User", entity_id=str(user.pk), after={"email": user.email}, ip_address=client_ip(request))
+        refresh = RefreshToken.for_user(user)
+        return Response({"access": str(refresh.access_token), "refresh": str(refresh), "user": UserSerializer(user).data}, status=status.HTTP_201_CREATED)
 
 
 class MeView(APIView):
@@ -178,6 +229,45 @@ class CategoryViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "description"]
     ordering_fields = ["display_order", "name", "created_at"]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if not (self.request.user.is_authenticated and self.request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
+            qs = qs.filter(is_active=True, is_archived=False)
+        return qs
+
+    def _ensure_catalog_manager(self, request):
+        if not (request.user.is_authenticated and request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
+            raise PermissionDenied("Role non autorise.")
+
+    def _set_active(self, request, category, active):
+        before = {"is_active": category.is_active}
+        category.is_active = active
+        category.save(update_fields=["is_active", "updated_at"])
+        AuditLog.objects.create(
+            actor=request.user,
+            action="CATEGORY_ACTIVATED" if active else "CATEGORY_DEACTIVATED",
+            entity="Category",
+            entity_id=str(category.pk),
+            before=before,
+            after={"is_active": category.is_active},
+            ip_address=client_ip(request),
+        )
+        return Response(self.get_serializer(category).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, slug=None):
+        self._ensure_catalog_manager(request)
+        return self._set_active(request, self.get_object(), False)
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, slug=None):
+        self._ensure_catalog_manager(request)
+        category = self.get_object()
+        if category.is_archived:
+            category.is_archived = False
+            category.save(update_fields=["is_archived", "updated_at"])
+        return self._set_active(request, category, True)
+
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def archive(self, request, slug=None):
         category = self.get_object()
@@ -213,7 +303,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
 
 class BrandViewSet(viewsets.ModelViewSet):
-    queryset = Brand.objects.all()
+    queryset = Brand.objects.all().order_by("name", "id")
     serializer_class = BrandSerializer
     permission_classes = [IsCatalogManagerOrReadOnly]
     lookup_field = "slug"
@@ -251,22 +341,41 @@ class ProductViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         if not (self.request.user.is_authenticated and self.request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
-            qs = qs.filter(status=Product.Status.ACTIVE)
+            qs = qs.filter(status=Product.Status.ACTIVE, category__is_active=True, category__is_archived=False)
         if self.request.query_params.get("promotion") == "true":
             qs = qs.filter(promotional_price__isnull=False)
         return qs.order_by("-created_at")
+
+    def _filtered_products_from_payload(self, request):
+        ids = request.data.get("ids")
+        qs = Product.objects.all()
+        if request.data.get("all_results") is True:
+            search = request.data.get("search", "")
+            status_filter = request.data.get("status", "")
+            category_id = request.data.get("category_id")
+            brand_id = request.data.get("brand_id")
+            if search:
+                qs = qs.filter(Q(name__icontains=search) | Q(sku__icontains=search) | Q(short_description__icontains=search) | Q(description__icontains=search) | Q(brand__name__icontains=search) | Q(category__name__icontains=search))
+            if status_filter:
+                qs = qs.filter(status=status_filter)
+            if category_id:
+                qs = qs.filter(category_id=category_id)
+            if brand_id:
+                qs = qs.filter(brand_id=brand_id)
+            return qs
+        return qs.filter(id__in=ids or [])
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
         if not (request.user.is_authenticated and request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
             Product.objects.filter(pk=instance.pk).update(view_count=instance.view_count + 1)
-        return Response(ProductSerializer(instance).data)
+        return Response(ProductSerializer(instance, context=self.get_serializer_context()).data)
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         product = serializer.save()
-        return Response(ProductSerializer(product).data, status=201)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data, status=201)
 
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
@@ -274,21 +383,21 @@ class ProductViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(product, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         product = serializer.save()
-        return Response(ProductSerializer(product).data)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def archive(self, request, slug=None):
         product = self.get_object()
         product.status = Product.Status.ARCHIVED
         product.save(update_fields=["status"])
-        return Response(self.get_serializer(product).data)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def restore(self, request, slug=None):
         product = self.get_object()
         product.status = Product.Status.ACTIVE
         product.save(update_fields=["status"])
-        return Response(self.get_serializer(product).data)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def duplicate(self, request, slug=None):
@@ -309,13 +418,12 @@ class ProductViewSet(viewsets.ModelViewSet):
             variant.save()
             variant.values.set(old_variant.values.all())
             Inventory.objects.create(variant=variant, quantity=getattr(old_variant, "inventory", None).quantity if hasattr(old_variant, "inventory") else 0)
-        return Response(ProductSerializer(product).data, status=201)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data, status=201)
 
     @action(detail=False, methods=["post"], permission_classes=[IsAdminRole])
     def bulk(self, request):
-        ids = request.data.get("ids", [])
         action_name = request.data.get("action")
-        qs = Product.objects.filter(id__in=ids)
+        qs = self._filtered_products_from_payload(request)
         if action_name == "activate":
             qs.update(status=Product.Status.ACTIVE)
         elif action_name == "deactivate":
@@ -329,6 +437,46 @@ class ProductViewSet(viewsets.ModelViewSet):
         else:
             return Response({"detail": "Action bulk inconnue."}, status=400)
         return Response({"detail": "Action appliquee.", "count": qs.count()})
+
+    def _remove_or_archive_products(self, qs):
+        archived = 0
+        deleted = 0
+        for product in qs:
+            try:
+                CartItem.objects.filter(variant__product=product).delete()
+                StockMovement.objects.filter(variant__product=product).delete()
+                product.delete()
+                deleted += 1
+            except ProtectedError:
+                product.status = Product.Status.ARCHIVED
+                product.variants.update(is_active=False)
+                product.save(update_fields=["status"])
+                archived += 1
+        return archived, deleted
+
+    @action(detail=False, methods=["post"], permission_classes=[IsDeveloper])
+    def bulk_delete(self, request):
+        confirmation = request.data.get("confirmation")
+        if confirmation != "SUPPRIMER TOUS LES PRODUITS":
+            return Response({"confirmation": "Confirmation incorrecte."}, status=400)
+
+        ids = request.data.get("ids")
+        all_results = request.data.get("all_results") is True
+        qs = self._filtered_products_from_payload(request)
+        products = list(qs.select_related("category", "brand").prefetch_related("variants"))
+        if not products:
+            return Response({"detail": "Aucun produit concerne.", "count": 0, "archived": 0, "deleted": 0})
+
+        with transaction.atomic():
+            archived, deleted = self._remove_or_archive_products(products)
+            AuditLog.objects.create(
+                actor=request.user,
+                action="PRODUCT_BULK_DELETE",
+                entity="Product",
+                after={"count": len(products), "archived": archived, "deleted": deleted, "all_results": all_results, "ids": ids or []},
+                ip_address=client_ip(request),
+            )
+        return Response({"detail": "Produits traites.", "count": len(products), "archived": archived, "deleted": deleted})
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def upload_images(self, request, slug=None):
@@ -352,7 +500,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             except Exception:
                 return Response({"images": "Image invalide."}, status=400)
             created.append(ProductImage.objects.create(product=product, image=file, is_main=not product.images.filter(is_main=True).exists() and index == 0, display_order=product.images.count() + index))
-        return Response(ProductSerializer(product).data, status=201)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data, status=201)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def set_main_image(self, request, slug=None):
@@ -361,14 +509,14 @@ class ProductViewSet(viewsets.ModelViewSet):
         product.images.update(is_main=False)
         image.is_main = True
         image.save(update_fields=["is_main"])
-        return Response(ProductSerializer(product).data)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminRole])
     def reorder_images(self, request, slug=None):
         product = self.get_object()
         for item in request.data.get("items", []):
             product.images.filter(pk=item.get("id")).update(display_order=item.get("display_order", 0))
-        return Response(ProductSerializer(product).data)
+        return Response(ProductSerializer(product, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["delete"], permission_classes=[IsAdminRole])
     def delete_image(self, request, slug=None):
@@ -377,11 +525,7 @@ class ProductViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         product = self.get_object()
-        if product.orderitem_set.exists():
-            product.status = Product.Status.ARCHIVED
-            product.save(update_fields=["status"])
-            return Response({"detail": "Produit archive car il est lie a des commandes."})
-        product.delete()
+        self._remove_or_archive_products([product])
         return Response(status=204)
 
 
@@ -398,17 +542,24 @@ class CartViewSet(viewsets.ViewSet):
     def add(self, request):
         cart = get_or_create_cart(request)
         serializer = CartItemSerializer(data=request.data)
+        if not serializer.is_valid() and request.data.get("variant_id") and request.data.get("product_id"):
+            fallback_data = request.data.copy()
+            fallback_data.pop("variant_id", None)
+            serializer = CartItemSerializer(data=fallback_data)
         serializer.is_valid(raise_exception=True)
-        item = add_cart_item(cart, serializer.validated_data["variant"], serializer.validated_data["quantity"])
+        item = add_cart_item(cart, variant=serializer.validated_data.get("variant"), product=serializer.validated_data.get("product"), quantity=serializer.validated_data["quantity"])
         return Response(CartItemSerializer(item).data, status=201)
 
     @action(detail=False, methods=["patch"])
     def update_item(self, request):
         cart = get_or_create_cart(request)
-        item = cart.items.get(pk=request.data["item_id"])
-        item.quantity = max(int(request.data.get("quantity", 1)), 1)
+        item = cart.items.select_related("variant__product").get(pk=request.data["item_id"])
+        quantity = max(int(request.data.get("quantity", 1)), 1)
+        item.quantity = quantity
         item.save(update_fields=["quantity"])
-        return Response(CartItemSerializer(item).data)
+        data = CartSerializer(cart).data
+        data.update(cart_totals(cart))
+        return Response(data)
 
     @action(detail=False, methods=["delete"])
     def remove(self, request):
@@ -436,24 +587,39 @@ class CheckoutView(APIView):
 
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
-    permission_classes = [IsOrderManager]
+    permission_classes = [IsOrderManagerOrCustomer]
     search_fields = ["order_number", "user__email", "guest_email", "shipping_phone", "tracking_number"]
     filterset_fields = ["status", "payment_method", "shipping_city"]
     ordering_fields = ["created_at", "total"]
 
     def get_queryset(self):
-        qs = Order.objects.prefetch_related("items", "status_history")
+        qs = Order.objects.select_related("user", "delivery_zone").prefetch_related("items", "status_history", "refunds").order_by("-created_at")
+        if self.request.user.role == User.Role.CUSTOMER:
+            qs = qs.filter(user=self.request.user)
+        date_from = self.request.query_params.get("date_from")
+        date_to = self.request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
         return qs
 
     def update(self, request, *args, **kwargs):
+        if request.user.role == User.Role.CUSTOMER:
+            return Response({"detail": "Les clients ne peuvent pas modifier une commande."}, status=403)
         if "status" in request.data:
             return Response({"detail": "Utilisez l'action transition pour changer le statut d'une commande."}, status=400)
         return super().update(request, *args, **kwargs)
 
     def partial_update(self, request, *args, **kwargs):
+        if request.user.role == User.Role.CUSTOMER:
+            return Response({"detail": "Les clients ne peuvent pas modifier une commande."}, status=403)
         if "status" in request.data:
             return Response({"detail": "Utilisez l'action transition pour changer le statut d'une commande."}, status=400)
         return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        return Response({"detail": "La suppression de commande est interdite; utilisez une transition de statut."}, status=405)
 
     @action(detail=True, methods=["post"], permission_classes=[IsOrderManager])
     def transition(self, request, pk=None):
@@ -472,11 +638,37 @@ class OrderViewSet(viewsets.ModelViewSet):
             if reason not in allowed_reasons:
                 return Response({"cancellation_reason": "Choisissez une raison d'annulation valide."}, status=400)
             note = f"Annulation: {allowed_reasons[reason]}. {note}".strip()
-        order = transition_order(self.get_object(), new_status, request.user, note)
+        order = transition_order(self.get_object(), new_status, request.user, note, force=True)
         if new_status == Order.Status.CANCELLED and note:
             order.internal_note = f"{order.internal_note}\n{note}".strip()
             order.save(update_fields=["internal_note", "updated_at"])
         return Response(OrderSerializer(order).data)
+
+    @action(detail=True, methods=["get"], permission_classes=[IsOrderManager])
+    def invoice(self, request, pk=None):
+        order = self.get_object()
+        lines = [
+            "DOLPHIN - Facture",
+            f"Commande: {order.order_number}",
+            f"Date: {timezone.localtime(order.created_at):%Y-%m-%d %H:%M}",
+            f"Client: {order.shipping_full_name}",
+            f"Email: {order.guest_email or getattr(order.user, 'email', '')}",
+            f"Adresse: {order.shipping_address}, {order.shipping_city}",
+            "",
+            "Articles:",
+        ]
+        for item in order.items.all():
+            lines.append(f"- {item.product_name} {item.variant_label} x{item.quantity}: {item.total} MAD")
+        lines += [
+            "",
+            f"Sous-total: {order.subtotal} MAD",
+            f"Remise: {order.discount_total} MAD",
+            "Livraison: Gratuite",
+            f"Total: {order.total} MAD",
+            f"Paiement: {order.payment_method}",
+        ]
+        AuditLog.objects.create(actor=request.user, action="INVOICE_DOWNLOADED", entity="Order", entity_id=str(order.pk), ip_address=client_ip(request))
+        return simple_pdf_response(f"facture-{order.order_number}.pdf", lines)
 
     @action(detail=True, methods=["patch"], permission_classes=[IsOrderManager])
     def update_details(self, request, pk=None):
@@ -531,7 +723,7 @@ class WishlistViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         wishlist, _ = Wishlist.objects.get_or_create(user=self.request.user)
-        return wishlist.items.select_related("product")
+        return wishlist.items.select_related("product").order_by("-created_at")
 
     def perform_create(self, serializer):
         wishlist, _ = Wishlist.objects.get_or_create(user=self.request.user)
@@ -541,9 +733,10 @@ class WishlistViewSet(viewsets.ModelViewSet):
 class ReviewViewSet(viewsets.ModelViewSet):
     serializer_class = ProductReviewSerializer
     permission_classes = [IsAuthenticated]
+    filterset_fields = ["product", "status", "rating"]
 
     def get_queryset(self):
-        qs = ProductReview.objects.select_related("user", "product")
+        qs = ProductReview.objects.select_related("user", "product").order_by("-created_at")
         if self.request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER, User.Role.CUSTOMER_SUPPORT}:
             return qs
         return qs.filter(Q(user=self.request.user) | Q(status=ProductReview.Status.APPROVED))
@@ -577,7 +770,7 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return CustomerNotification.objects.filter(user=self.request.user)
+        return CustomerNotification.objects.filter(user=self.request.user).order_by("-created_at", "-id")
 
     @action(detail=True, methods=["post"])
     def read(self, request, pk=None):
@@ -592,7 +785,7 @@ class SupportTicketViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        qs = SupportTicket.objects.prefetch_related("messages")
+        qs = SupportTicket.objects.prefetch_related("messages").order_by("-created_at")
         if self.request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER, User.Role.CUSTOMER_SUPPORT}:
             return qs
         return qs.filter(user=self.request.user)
@@ -606,19 +799,93 @@ class ReturnRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        qs = ReturnRequest.objects.all()
+        qs = ReturnRequest.objects.order_by("-created_at")
         if self.request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER, User.Role.CUSTOMER_SUPPORT}:
             return qs
         return qs.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        request_return = serializer.save(user=self.request.user)
+        ReturnHistory.objects.create(return_request=request_return, to_status=request_return.status, actor=self.request.user, note="Demande de retour creee")
+        AuditLog.objects.create(actor=self.request.user, action="RETURN_CREATED", entity="ReturnRequest", entity_id=str(request_return.pk), after={"order": request_return.order_id}, ip_address=client_ip(self.request))
+
+    def _admin_decide(self, request, status_value):
+        return_request = self.get_object()
+        previous = return_request.status
+        return_request.status = status_value
+        return_request.admin_decision = request.data.get("decision", "")
+        return_request.decided_by = request.user
+        return_request.decided_at = timezone.now()
+        return_request.save(update_fields=["status", "admin_decision", "decided_by", "decided_at", "updated_at"])
+        ReturnHistory.objects.create(return_request=return_request, from_status=previous, to_status=status_value, actor=request.user, note=return_request.admin_decision)
+        AuditLog.objects.create(actor=request.user, action="RETURN_STATUS_CHANGED", entity="ReturnRequest", entity_id=str(return_request.pk), before={"status": previous}, after={"status": status_value}, ip_address=client_ip(request))
+        return Response(self.get_serializer(return_request).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsOrderManager])
+    def approve(self, request, pk=None):
+        return self._admin_decide(request, ReturnRequest.Status.APPROVED)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsOrderManager])
+    def reject(self, request, pk=None):
+        return self._admin_decide(request, ReturnRequest.Status.REJECTED)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsOrderManager])
+    def replace(self, request, pk=None):
+        return_request = self.get_object()
+        with transaction.atomic():
+            previous = return_request.status
+            return_request.status = ReturnRequest.Status.REPLACED
+            return_request.decided_by = request.user
+            return_request.decided_at = timezone.now()
+            return_request.admin_decision = request.data.get("decision", "Remplacement accepte")
+            return_request.save(update_fields=["status", "decided_by", "decided_at", "admin_decision", "updated_at"])
+            ReturnHistory.objects.create(return_request=return_request, from_status=previous, to_status=return_request.status, actor=request.user, note=return_request.admin_decision)
+            AuditLog.objects.create(actor=request.user, action="RETURN_REPLACED", entity="ReturnRequest", entity_id=str(return_request.pk), ip_address=client_ip(request))
+        return Response(self.get_serializer(return_request).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsOrderManager])
+    def refund(self, request, pk=None):
+        return_request = self.get_object()
+        amount = Decimal(str(request.data.get("amount", return_request.order.total)))
+        serializer = RefundSerializer(data={"order": return_request.order_id, "amount": amount, "method": request.data.get("method", "MANUAL"), "reference": request.data.get("reference", ""), "status": Refund.Status.APPROVED, "reason": request.data.get("reason", return_request.reason)})
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            refund = serializer.save(processed_by=request.user, processed_at=timezone.now())
+            previous = return_request.status
+            return_request.status = ReturnRequest.Status.REFUNDED
+            return_request.decided_by = request.user
+            return_request.decided_at = timezone.now()
+            return_request.admin_decision = request.data.get("decision", "Remboursement accepte")
+            return_request.save(update_fields=["status", "decided_by", "decided_at", "admin_decision", "updated_at"])
+            ReturnHistory.objects.create(return_request=return_request, from_status=previous, to_status=return_request.status, actor=request.user, note=f"Remboursement {refund.amount} MAD")
+            AuditLog.objects.create(actor=request.user, action="REFUND_CREATED", entity="Refund", entity_id=str(refund.pk), after={"order": return_request.order_id, "amount": str(refund.amount)}, ip_address=client_ip(request))
+        return Response({"return": self.get_serializer(return_request).data, "refund": RefundSerializer(refund).data})
 
 
 class HomepageBannerViewSet(viewsets.ModelViewSet):
     queryset = HomepageBanner.objects.filter(is_active=True).order_by("-created_at")
     serializer_class = HomepageBannerSerializer
     permission_classes = [IsCatalogManagerOrReadOnly]
+
+
+class NewsletterSubscribeView(APIView):
+    permission_classes = [AllowAny]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        email = str(request.data.get("email", "")).strip().lower()
+        existing = NewsletterSubscriber.objects.filter(email=email).first()
+        if existing:
+            existing.is_active = True
+            existing.save(update_fields=["is_active", "updated_at"])
+            return Response(NewsletterSubscriberSerializer(existing).data, status=status.HTTP_201_CREATED)
+        serializer = NewsletterSubscriberSerializer(data={"email": email})
+        serializer.is_valid(raise_exception=True)
+        subscriber, _ = NewsletterSubscriber.objects.update_or_create(
+            email=serializer.validated_data["email"],
+            defaults={"is_active": True},
+        )
+        return Response(NewsletterSubscriberSerializer(subscriber).data, status=status.HTTP_201_CREATED)
 
 
 class AdminDashboardView(APIView):
@@ -664,6 +931,161 @@ class StaffViewSet(viewsets.ModelViewSet):
         user.delete()
         AuditLog.objects.create(actor=request.user, action="USER_DELETED", entity="User", entity_id=str(user.pk), before=before, ip_address=client_ip(request))
         return Response(status=204)
+
+
+class CustomerAdminViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = DeveloperUserSerializer
+    permission_classes = [IsAdminRole]
+    search_fields = ["email", "username", "first_name", "last_name", "phone"]
+    filterset_fields = ["status"]
+    ordering_fields = ["date_joined", "last_login", "email"]
+
+    def get_queryset(self):
+        return get_user_model().objects.filter(role=User.Role.CUSTOMER).annotate(
+            order_count=Count("orders", distinct=True),
+            total_spent=Sum("orders__total"),
+        ).order_by("-date_joined")
+
+    def _normalize_phone(self, phone):
+        digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+        if digits.startswith("0"):
+            digits = f"212{digits[1:]}"
+        return digits
+
+    def _normalize_name(self, name):
+        return " ".join(str(name or "").strip().lower().split())
+
+    def _client_key_for_order(self, order):
+        phone = self._normalize_phone(order.shipping_phone)
+        if phone:
+            return f"phone:{phone}"
+        name = self._normalize_name(order.shipping_full_name)
+        if name:
+            return f"name:{name}"
+        return f"email:{str(order.guest_email or '').strip().lower()}" or f"order:{order.pk}"
+
+    def _matching_orders_for_seed(self, seed):
+        seed_phone = self._normalize_phone(seed.shipping_phone)
+        seed_name = self._normalize_name(seed.shipping_full_name)
+        matches = []
+        for order in Order.objects.select_related("user", "delivery_zone").prefetch_related("items", "status_history").order_by("-created_at"):
+            same_phone = seed_phone and self._normalize_phone(order.shipping_phone) == seed_phone
+            same_name = seed_name and self._normalize_name(order.shipping_full_name) == seed_name
+            if same_phone or same_name or order.pk == seed.pk:
+                matches.append(order)
+        return matches
+
+    def list(self, request, *args, **kwargs):
+        search = request.query_params.get("search", "").strip().lower()
+        status_filter = request.query_params.get("status", "")
+        source_filter = request.query_params.get("source", "")
+        min_orders = int(request.query_params.get("min_orders") or 0)
+
+        all_orders = list(Order.objects.select_related("user", "delivery_zone").prefetch_related("items", "status_history").order_by("-created_at"))
+        registered = DeveloperUserSerializer(self.get_queryset(), many=True).data
+        rows = []
+        registered_keys = set()
+        for row in registered:
+            account_phone = self._normalize_phone(row.get("phone"))
+            account_name = self._normalize_name(f"{row.get('first_name', '')} {row.get('last_name', '')}")
+            keys = {key for key in [f"phone:{account_phone}" if account_phone else "", f"name:{account_name}" if account_name else ""] if key}
+            registered_keys.update(keys)
+            matched_orders = [
+                order for order in all_orders
+                if order.user_id == row["id"] or self._client_key_for_order(order) in keys
+            ]
+            row["source"] = "ACCOUNT"
+            row["order_count"] = len(matched_orders)
+            row["total_spent"] = str(sum((order.total or Decimal("0.00")) for order in matched_orders) or Decimal("0.00"))
+            rows.append(row)
+
+        guest_groups = {}
+        guest_orders = [order for order in all_orders if not order.user_id]
+        for order in guest_orders:
+            key = self._client_key_for_order(order)
+            if key in registered_keys:
+                continue
+            group = guest_groups.setdefault(key, {
+                "id": f"guest-{order.pk}",
+                "email": order.guest_email,
+                "username": "",
+                "first_name": order.shipping_full_name,
+                "last_name": "",
+                "phone": order.shipping_phone,
+                "role": "CUSTOMER",
+                "status": "GUEST",
+                "date_joined": order.created_at,
+                "last_login": None,
+                "order_count": 0,
+                "total_spent": Decimal("0.00"),
+                "source": "GUEST",
+            })
+            group["order_count"] += 1
+            group["total_spent"] += order.total or Decimal("0.00")
+            if order.created_at > group["date_joined"]:
+                group["date_joined"] = order.created_at
+                group["first_name"] = order.shipping_full_name
+                group["email"] = order.guest_email
+                group["phone"] = order.shipping_phone
+
+        for row in guest_groups.values():
+            row["date_joined"] = row["date_joined"].isoformat()
+            row["total_spent"] = str(row["total_spent"])
+            rows.append(row)
+
+        if source_filter:
+            rows = [row for row in rows if row.get("source") == source_filter]
+        if status_filter:
+            rows = [row for row in rows if row.get("status") == status_filter]
+        if search:
+            rows = [
+                row for row in rows
+                if search in " ".join(str(row.get(field) or "").lower() for field in ["email", "username", "first_name", "last_name", "phone"]).lower()
+            ]
+        if min_orders:
+            rows = [row for row in rows if int(row.get("order_count") or 0) >= min_orders]
+
+        rows.sort(key=lambda row: str(row.get("date_joined") or ""), reverse=True)
+        page = self.paginate_queryset(rows)
+        if page is not None:
+            return self.get_paginated_response(page)
+        return Response({"count": len(rows), "results": rows})
+
+    @action(detail=True, methods=["get"], permission_classes=[IsAdminRole])
+    def orders(self, request, pk=None):
+        if str(pk).startswith("guest-"):
+            seed = Order.objects.get(pk=str(pk).replace("guest-", "", 1), user__isnull=True)
+            return Response(OrderSerializer(self._matching_orders_for_seed(seed), many=True).data)
+        customer = self.get_object()
+        customer_phone = self._normalize_phone(customer.phone)
+        customer_name = self._normalize_name(f"{customer.first_name} {customer.last_name}")
+        matches = []
+        for order in Order.objects.select_related("user", "delivery_zone").prefetch_related("items", "status_history").order_by("-created_at"):
+            same_phone = customer_phone and self._normalize_phone(order.shipping_phone) == customer_phone
+            same_name = customer_name and self._normalize_name(order.shipping_full_name) == customer_name
+            if order.user_id == customer.id or order.guest_email.lower() == customer.email.lower() or same_phone or same_name:
+                matches.append(order)
+        return Response(OrderSerializer(matches, many=True).data)
+
+    @action(detail=True, methods=["patch"], permission_classes=[IsAdminRole])
+    def status(self, request, pk=None):
+        customer = self.get_object()
+        next_status = request.data.get("status")
+        if next_status not in User.Status.values:
+            return Response({"status": "Statut invalide."}, status=400)
+        before = {"email": customer.email, "status": customer.status}
+        customer.status = next_status
+        customer.save(update_fields=["status"])
+        AuditLog.objects.create(
+            actor=request.user,
+            action="CUSTOMER_STATUS_UPDATED",
+            entity="User",
+            entity_id=str(customer.pk),
+            before=before,
+            after={"email": customer.email, "status": customer.status},
+            ip_address=client_ip(request),
+        )
+        return Response(DeveloperUserSerializer(customer, context={"request": request}).data)
 
 
 class DeveloperDashboardView(APIView):
@@ -749,7 +1171,7 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class DeveloperInventoryView(APIView):
-    permission_classes = [IsDeveloper]
+    permission_classes = [IsAdminRole]
 
     def get(self, request):
         rows = []
@@ -770,29 +1192,204 @@ class DeveloperInventoryView(APIView):
             )
         return Response({"count": len(rows), "results": rows})
 
+    def post(self, request):
+        variant_id = request.data.get("variant_id")
+        reason = str(request.data.get("reason", "")).strip()
+        if not reason:
+            return Response({"reason": "Motif obligatoire."}, status=400)
+        try:
+            quantity = int(request.data.get("quantity"))
+        except (TypeError, ValueError):
+            return Response({"quantity": "Quantite invalide."}, status=400)
+        with transaction.atomic():
+            inventory = Inventory.objects.select_for_update().select_related("variant__product").get(variant_id=variant_id)
+            before = inventory.quantity
+            inventory.quantity = max(quantity, 0)
+            inventory.save(update_fields=["quantity"])
+            delta = inventory.quantity - before
+            StockMovement.objects.create(variant=inventory.variant, movement_type=StockMovement.Type.ADJUSTMENT, quantity=delta, reason=reason, actor=request.user)
+            AuditLog.objects.create(actor=request.user, action="STOCK_ADJUSTED", entity="Inventory", entity_id=str(inventory.pk), before={"quantity": before}, after={"quantity": inventory.quantity, "reason": reason}, ip_address=client_ip(request))
+        return Response({"variant_id": variant_id, "quantity": inventory.quantity, "delta": delta})
+
+
+class SupplierViewSet(viewsets.ModelViewSet):
+    serializer_class = SupplierSerializer
+    permission_classes = [IsDeveloper]
+    search_fields = ["name", "base_url"]
+    filterset_fields = ["is_active"]
+    ordering_fields = ["name", "created_at", "percentage_margin"]
+
+    def get_queryset(self):
+        return Supplier.objects.annotate(product_count=Count("external_products")).order_by("name")
+
+    def perform_create(self, serializer):
+        supplier = serializer.save()
+        AuditLog.objects.create(actor=self.request.user, action="SUPPLIER_CREATED", entity="Supplier", entity_id=str(supplier.pk), after={"name": supplier.name}, ip_address=client_ip(self.request))
+
+
+class ExpenseViewSet(viewsets.ModelViewSet):
+    serializer_class = ExpenseSerializer
+    permission_classes = [IsDeveloper]
+    search_fields = ["category", "reference", "notes", "supplier__name"]
+    filterset_fields = ["category", "supplier"]
+    ordering_fields = ["date", "amount", "created_at"]
+
+    def get_queryset(self):
+        return Expense.objects.select_related("supplier", "created_by").order_by("-date", "-created_at")
+
+    def perform_create(self, serializer):
+        expense = serializer.save(created_by=self.request.user)
+        AuditLog.objects.create(actor=self.request.user, action="EXPENSE_CREATED", entity="Expense", entity_id=str(expense.pk), after={"amount": str(expense.amount), "category": expense.category}, ip_address=client_ip(self.request))
+
+
+class RefundViewSet(viewsets.ModelViewSet):
+    serializer_class = RefundSerializer
+    permission_classes = [IsOrderManager]
+    search_fields = ["order__order_number", "reference", "reason"]
+    filterset_fields = ["status", "method"]
+    ordering_fields = ["created_at", "amount"]
+
+    def get_queryset(self):
+        return Refund.objects.select_related("order", "processed_by").order_by("-created_at")
+
+    def perform_create(self, serializer):
+        refund = serializer.save(processed_by=self.request.user, processed_at=timezone.now())
+        AuditLog.objects.create(actor=self.request.user, action="REFUND_CREATED", entity="Refund", entity_id=str(refund.pk), after={"amount": str(refund.amount), "order": refund.order_id}, ip_address=client_ip(self.request))
+
 
 class DeveloperExportView(APIView):
-    permission_classes = [IsDeveloper]
+    permission_classes = [IsAdminRole]
+
+    def _date_filtered(self, request, qs, field="created_at"):
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(**{f"{field}__date__gte": date_from})
+        if date_to:
+            qs = qs.filter(**{f"{field}__date__lte": date_to})
+        return qs
 
     def get(self, request, kind):
+        rows = []
+        if kind == "products":
+            headers = ["sku", "name", "status", "regular_price", "current_price", "category", "brand"]
+            qs = Product.objects.select_related("category", "brand")
+            if request.query_params.get("status"):
+                qs = qs.filter(status=request.query_params["status"])
+            if request.query_params.get("category"):
+                qs = qs.filter(category_id=request.query_params["category"])
+            if request.query_params.get("brand"):
+                qs = qs.filter(brand_id=request.query_params["brand"])
+            rows = [[product.sku, product.name, product.status, product.regular_price, product.current_price, product.category.name, product.brand.name if product.brand else ""] for product in qs]
+        elif kind == "orders":
+            headers = ["order_number", "status", "customer", "city", "total", "created_at"]
+            qs = self._date_filtered(request, Order.objects.all())
+            if request.query_params.get("status"):
+                qs = qs.filter(status=request.query_params["status"])
+            if request.query_params.get("city"):
+                qs = qs.filter(shipping_city__iexact=request.query_params["city"])
+            rows = [[order.order_number, order.status, order.shipping_full_name, order.shipping_city, order.total, order.created_at] for order in qs]
+        elif kind == "customers":
+            headers = ["email", "first_name", "last_name", "role", "status", "date_joined"]
+            qs = self._date_filtered(request, get_user_model().objects.filter(role=User.Role.CUSTOMER), "date_joined")
+            if request.query_params.get("status"):
+                qs = qs.filter(status=request.query_params["status"])
+            rows = [[user.email, user.first_name, user.last_name, user.role, user.status, user.date_joined] for user in qs]
+        elif kind == "staff":
+            if request.user.role != User.Role.SUPER_ADMIN:
+                return Response({"detail": "Export staff reserve au Developer."}, status=403)
+            headers = ["email", "first_name", "last_name", "role", "status", "is_staff", "date_joined"]
+            qs = self._date_filtered(request, get_user_model().objects.exclude(role=User.Role.CUSTOMER), "date_joined")
+            if request.query_params.get("role"):
+                qs = qs.filter(role=request.query_params["role"])
+            rows = [[user.email, user.first_name, user.last_name, user.role, user.status, user.is_staff, user.date_joined] for user in qs]
+        elif kind == "expenses":
+            headers = ["category", "amount", "date", "supplier", "reference", "created_by"]
+            qs = Expense.objects.select_related("supplier", "created_by")
+            if request.query_params.get("category"):
+                qs = qs.filter(category__iexact=request.query_params["category"])
+            if request.query_params.get("supplier"):
+                qs = qs.filter(supplier_id=request.query_params["supplier"])
+            if request.query_params.get("date_from"):
+                qs = qs.filter(date__gte=request.query_params["date_from"])
+            if request.query_params.get("date_to"):
+                qs = qs.filter(date__lte=request.query_params["date_to"])
+            rows = [[expense.category, expense.amount, expense.date, expense.supplier.name if expense.supplier else "", expense.reference, expense.created_by.email if expense.created_by else ""] for expense in qs]
+        elif kind == "stock":
+            headers = ["product", "sku", "quantity", "reserved_quantity", "available_quantity", "low_stock_threshold", "state"]
+            qs = Inventory.objects.select_related("variant__product").order_by("variant__product__name")
+            state = request.query_params.get("state")
+            if state == "low":
+                qs = qs.filter(quantity__lte=F("variant__product__low_stock_threshold"), quantity__gt=0)
+            elif state == "out":
+                qs = qs.filter(quantity=0)
+            rows = [
+                [
+                    inv.variant.product.name,
+                    inv.variant.sku,
+                    inv.quantity,
+                    inv.reserved_quantity,
+                    inv.available_quantity,
+                    inv.variant.product.low_stock_threshold,
+                    "out" if inv.quantity == 0 else "low" if inv.quantity <= inv.variant.product.low_stock_threshold else "ok",
+                ]
+                for inv in qs
+            ]
+        elif kind == "coupons":
+            headers = ["code", "discount_type", "value", "minimum_amount", "is_active", "starts_at", "ends_at"]
+            qs = Coupon.objects.all()
+            if request.query_params.get("is_active") in {"true", "false"}:
+                qs = qs.filter(is_active=request.query_params["is_active"] == "true")
+            rows = [[coupon.code, coupon.discount_type, coupon.value, coupon.minimum_amount, coupon.is_active, coupon.starts_at, coupon.ends_at] for coupon in qs]
+        elif kind == "suppliers":
+            if request.user.role != User.Role.SUPER_ADMIN:
+                return Response({"detail": "Export fournisseurs reserve au Developer."}, status=403)
+            headers = ["name", "base_url", "percentage_margin", "fixed_cost", "minimum_profit", "is_active"]
+            qs = Supplier.objects.all()
+            if request.query_params.get("is_active") in {"true", "false"}:
+                qs = qs.filter(is_active=request.query_params["is_active"] == "true")
+            rows = [[supplier.name, supplier.base_url, supplier.percentage_margin, supplier.fixed_cost, supplier.minimum_profit, supplier.is_active] for supplier in qs]
+        elif kind == "margins":
+            headers = ["sku", "product", "sales_count", "current_price", "cost_price", "estimated_margin"]
+            qs = Product.objects.all()
+            rows = [
+                [
+                    product.sku,
+                    product.name,
+                    product.sales_count,
+                    product.current_price,
+                    product.cost_price or Decimal("0.00"),
+                    (product.current_price - (product.cost_price or Decimal("0.00"))) * product.sales_count,
+                ]
+                for product in qs
+            ]
+        else:
+            return Response({"detail": "Export inconnu."}, status=404)
+        file_format = request.query_params.get("file_format", "csv")
+        AuditLog.objects.create(actor=request.user, action="REPORT_EXPORTED", entity=kind, after={"format": file_format, "filters": dict(request.query_params)}, ip_address=client_ip(request))
+        if file_format == "pdf":
+            lines = [f"DOLPHIN - Rapport {kind}", f"Genere le {timezone.localtime(timezone.now()):%Y-%m-%d %H:%M}", ""]
+            lines.append(" | ".join(headers))
+            lines.extend(" | ".join(str(value) for value in row) for row in rows[:120])
+            return simple_pdf_response(f"dolphin-{kind}.pdf", lines)
+        if file_format == "xlsx":
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = kind[:31]
+            sheet.append(headers)
+            for row in rows:
+                sheet.append(row)
+            stream = BytesIO()
+            workbook.save(stream)
+            stream.seek(0)
+            response = HttpResponse(stream.read(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            response["Content-Disposition"] = f'attachment; filename="dolphin-{kind}.xlsx"'
+            return response
         response = HttpResponse(content_type="text/csv")
         response["Content-Disposition"] = f'attachment; filename="dolphin-{kind}.csv"'
         writer = csv.writer(response)
-        if kind == "products":
-            writer.writerow(["sku", "name", "status", "regular_price", "current_price", "category", "brand"])
-            for product in Product.objects.select_related("category", "brand"):
-                writer.writerow([product.sku, product.name, product.status, product.regular_price, product.current_price, product.category.name, product.brand.name if product.brand else ""])
-        elif kind == "orders":
-            writer.writerow(["order_number", "status", "customer", "city", "total", "created_at"])
-            for order in Order.objects.all():
-                writer.writerow([order.order_number, order.status, order.shipping_full_name, order.shipping_city, order.total, order.created_at])
-        elif kind == "customers":
-            writer.writerow(["email", "first_name", "last_name", "role", "status", "date_joined"])
-            for user in get_user_model().objects.all():
-                writer.writerow([user.email, user.first_name, user.last_name, user.role, user.status, user.date_joined])
-        else:
-            return Response({"detail": "Export inconnu."}, status=404)
-        AuditLog.objects.create(actor=request.user, action="CSV_EXPORTED", entity=kind, ip_address=client_ip(request))
+        writer.writerow(headers)
+        writer.writerows(rows)
         return response
 
 

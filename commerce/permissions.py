@@ -61,6 +61,16 @@ class IsOrderManager(BasePermission):
         return bool(request.user and request.user.is_authenticated and request.user.role in ORDER_MANAGERS)
 
 
+class IsOrderManagerOrCustomer(BasePermission):
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.status == User.Status.ACTIVE
+            and request.user.role in ORDER_MANAGERS | {User.Role.CUSTOMER}
+        )
+
+
 class CanManageProducts(IsCatalogManagerOrReadOnly):
     pass
 

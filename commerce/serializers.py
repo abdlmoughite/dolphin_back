@@ -1,5 +1,7 @@
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.db import IntegrityError
+from django.db.models import Sum
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
@@ -14,6 +16,7 @@ from .models import (
     CustomerAddress,
     CustomerNotification,
     DeliveryZone,
+    Expense,
     HomepageBanner,
     Inventory,
     Order,
@@ -27,7 +30,14 @@ from .models import (
     ProductReview,
     ProductVariant,
     Promotion,
+    NewsletterSubscriber,
+    Refund,
+    ReturnHistory,
+    ReturnItem,
     ReturnRequest,
+    StockMovement,
+    Supplier,
+    SupplierProduct,
     SupportMessage,
     SupportTicket,
     User,
@@ -210,7 +220,7 @@ class ProductSerializer(serializers.ModelSerializer):
     brand = BrandSerializer(read_only=True)
     brand_id = serializers.PrimaryKeyRelatedField(queryset=Brand.objects.all(), source="brand", write_only=True, required=False, allow_null=True)
     images = ProductImageSerializer(many=True, read_only=True)
-    variants = ProductVariantSerializer(many=True, read_only=True)
+    variants = serializers.SerializerMethodField()
     current_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     discount_percent = serializers.IntegerField(read_only=True)
     average_rating = serializers.FloatField(read_only=True, default=0)
@@ -227,13 +237,19 @@ class ProductSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"promotional_price": "Le prix promotionnel doit etre inferieur au prix normal."})
         return attrs
 
+    def get_variants(self, product):
+        request = self.context.get("request")
+        variants = product.variants.all()
+        if not (request and request.user.is_authenticated and request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
+            variants = variants.filter(is_active=True, product__status=Product.Status.ACTIVE, product__category__is_active=True, product__category__is_archived=False)
+        return ProductVariantSerializer(variants, many=True, context=self.context).data
+
 
 class AdminVariantWriteSerializer(serializers.Serializer):
     id = serializers.IntegerField(required=False)
     sku = serializers.CharField(max_length=90)
     price_override = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     is_active = serializers.BooleanField(default=True)
-    stock = serializers.IntegerField(min_value=0, default=0)
     color = serializers.CharField(required=False, allow_blank=True)
     size = serializers.CharField(required=False, allow_blank=True)
     capacity = serializers.CharField(required=False, allow_blank=True)
@@ -290,29 +306,42 @@ class AdminProductWriteSerializer(serializers.ModelSerializer):
 
     def _sync_variants(self, product, variants):
         if not variants:
-            variant, _ = ProductVariant.objects.get_or_create(product=product, sku=f"{product.sku}-DEFAULT")
-            Inventory.objects.get_or_create(variant=variant, defaults={"quantity": 0})
+            removed = product.variants.all()
+            CartItem.objects.filter(variant__in=removed).delete()
+            StockMovement.objects.filter(variant__in=removed).delete()
+            removed.delete()
             return
         seen = []
         for item in variants:
             variant_id = item.get("id")
             defaults = {"sku": item["sku"], "price_override": item.get("price_override"), "is_active": item.get("is_active", True)}
             if variant_id:
-                variant = ProductVariant.objects.get(pk=variant_id, product=product)
+                try:
+                    variant = ProductVariant.objects.get(pk=variant_id, product=product)
+                except ProductVariant.DoesNotExist as exc:
+                    raise serializers.ValidationError({"variants_payload": f"La variante {variant_id} n'appartient pas a ce produit."}) from exc
                 for key, value in defaults.items():
                     setattr(variant, key, value)
-                variant.save()
+                try:
+                    variant.save()
+                except IntegrityError as exc:
+                    raise serializers.ValidationError({"variants_payload": f"SKU variante deja utilise: {item['sku']}."}) from exc
             else:
-                variant, _ = ProductVariant.objects.update_or_create(product=product, sku=item["sku"], defaults=defaults)
+                try:
+                    variant, _ = ProductVariant.objects.update_or_create(product=product, sku=item["sku"], defaults=defaults)
+                except IntegrityError as exc:
+                    raise serializers.ValidationError({"variants_payload": f"SKU variante deja utilise: {item['sku']}."}) from exc
             values = [
                 self._attribute_value("Couleur", item.get("color", "")),
                 self._attribute_value("Taille", item.get("size", "")),
                 self._attribute_value("Capacite", item.get("capacity", "")),
             ]
             variant.values.set([value for value in values if value])
-            Inventory.objects.update_or_create(variant=variant, defaults={"quantity": item.get("stock", 0)})
             seen.append(variant.id)
-        product.variants.exclude(id__in=seen).update(is_active=False)
+        removed = product.variants.exclude(id__in=seen)
+        CartItem.objects.filter(variant__in=removed).delete()
+        StockMovement.objects.filter(variant__in=removed).delete()
+        removed.delete()
 
     def create(self, validated_data):
         variants = validated_data.pop("variants_payload", [])
@@ -369,15 +398,42 @@ class ProductImportJobSerializer(serializers.ModelSerializer):
 
 class CartItemSerializer(serializers.ModelSerializer):
     variant = ProductVariantSerializer(read_only=True)
-    variant_id = serializers.PrimaryKeyRelatedField(queryset=ProductVariant.objects.filter(is_active=True), source="variant", write_only=True)
+    product = ProductSerializer(read_only=True)
+    variant_id = serializers.PrimaryKeyRelatedField(queryset=ProductVariant.objects.filter(is_active=True, product__status=Product.Status.ACTIVE, product__category__is_active=True, product__category__is_archived=False), source="variant", write_only=True, required=False)
+    product_id = serializers.PrimaryKeyRelatedField(queryset=Product.objects.filter(status=Product.Status.ACTIVE, category__is_active=True, category__is_archived=False), source="product", write_only=True, required=False)
     line_total = serializers.SerializerMethodField()
+    product_name = serializers.SerializerMethodField()
+    product_slug = serializers.SerializerMethodField()
 
     class Meta:
         model = CartItem
-        fields = ["id", "variant", "variant_id", "quantity", "saved_for_later", "line_total"]
+        fields = ["id", "product", "product_id", "variant", "variant_id", "product_name", "product_slug", "quantity", "saved_for_later", "line_total"]
+
+    def validate(self, attrs):
+        variant = attrs.get("variant")
+        product = attrs.get("product")
+        if not variant and not product:
+            raise serializers.ValidationError({"product_id": "Produit requis."})
+        if variant and product and variant.product_id != product.id:
+            raise serializers.ValidationError({"variant_id": "La variante ne correspond pas au produit."})
+        if variant and not product:
+            attrs["product"] = variant.product
+        return attrs
 
     def get_line_total(self, obj):
-        return obj.variant.price * obj.quantity
+        product = obj.variant.product if obj.variant else obj.product
+        if not product:
+            return 0
+        unit_price = obj.variant.price if obj.variant else product.current_price
+        return unit_price * obj.quantity
+
+    def get_product_name(self, obj):
+        product = obj.variant.product if obj.variant else obj.product
+        return product.name if product else ""
+
+    def get_product_slug(self, obj):
+        product = obj.variant.product if obj.variant else obj.product
+        return product.slug if product else ""
 
 
 class CartSerializer(serializers.ModelSerializer):
@@ -407,9 +463,16 @@ class DeliveryZoneSerializer(serializers.ModelSerializer):
     class Meta:
         model = DeliveryZone
         fields = "__all__"
+        extra_kwargs = {"shipping_price": {"required": False}, "free_delivery_threshold": {"required": False}}
+
+    def validate(self, attrs):
+        attrs["shipping_price"] = 0
+        attrs["free_delivery_threshold"] = None
+        return attrs
 
 
 class CheckoutSerializer(serializers.Serializer):
+    idempotency_key = serializers.CharField(max_length=80, required=False, allow_blank=True)
     address_id = serializers.IntegerField(required=False)
     guest_email = serializers.EmailField(required=False, allow_blank=True)
     shipping_full_name = serializers.CharField(max_length=160, required=False)
@@ -489,10 +552,82 @@ class SupportTicketSerializer(serializers.ModelSerializer):
 
 
 class ReturnRequestSerializer(serializers.ModelSerializer):
+    class ReturnItemWriteSerializer(serializers.Serializer):
+        order_item = serializers.PrimaryKeyRelatedField(queryset=OrderItem.objects.select_related("order"))
+        quantity = serializers.IntegerField(min_value=1)
+
+    class ReturnItemReadSerializer(serializers.ModelSerializer):
+        product_name = serializers.CharField(source="order_item.product_name", read_only=True)
+        sku = serializers.CharField(source="order_item.sku", read_only=True)
+        ordered_quantity = serializers.IntegerField(source="order_item.quantity", read_only=True)
+
+        class Meta:
+            model = ReturnItem
+            fields = ["id", "order_item", "product_name", "sku", "ordered_quantity", "quantity"]
+
+    items = ReturnItemReadSerializer(many=True, read_only=True)
+    items_payload = ReturnItemWriteSerializer(many=True, write_only=True, required=False)
+    history = serializers.SerializerMethodField()
+
     class Meta:
         model = ReturnRequest
         fields = "__all__"
-        read_only_fields = ["user"]
+        read_only_fields = ["user", "status", "admin_decision", "decided_by", "decided_at", "items", "history"]
+
+    def get_history(self, obj):
+        return ReturnHistorySerializer(obj.history.select_related("actor").order_by("created_at"), many=True).data
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        order = attrs.get("order", getattr(self.instance, "order", None))
+        if request and request.user.role == User.Role.CUSTOMER and order and order.user_id != request.user.id:
+            raise serializers.ValidationError({"order": "Commande introuvable pour ce client."})
+        if request and request.user.role == User.Role.CUSTOMER and order and order.status != Order.Status.DELIVERED:
+            raise serializers.ValidationError({"order": "Un retour client est possible uniquement pour une commande livree."})
+        items = attrs.get("items_payload", [])
+        if not self.instance and not items:
+            raise serializers.ValidationError({"items_payload": "Ajoutez au moins un article a retourner."})
+        for item in items:
+            order_item = item["order_item"]
+            if order and order_item.order_id != order.id:
+                raise serializers.ValidationError({"items_payload": "Article introuvable dans cette commande."})
+            if item["quantity"] > order_item.quantity:
+                raise serializers.ValidationError({"items_payload": f"Quantite trop elevee pour {order_item.product_name}."})
+        return attrs
+
+    def create(self, validated_data):
+        items = validated_data.pop("items_payload", [])
+        return_request = super().create(validated_data)
+        ReturnItem.objects.bulk_create(
+            [ReturnItem(return_request=return_request, order_item=item["order_item"], quantity=item["quantity"]) for item in items]
+        )
+        return return_request
+
+
+class ReturnHistorySerializer(serializers.ModelSerializer):
+    actor_email = serializers.EmailField(source="actor.email", read_only=True)
+
+    class Meta:
+        model = ReturnHistory
+        fields = ["id", "from_status", "to_status", "note", "actor_email", "created_at"]
+
+
+class RefundSerializer(serializers.ModelSerializer):
+    processed_by_email = serializers.EmailField(source="processed_by.email", read_only=True)
+
+    class Meta:
+        model = Refund
+        fields = "__all__"
+        read_only_fields = ["processed_by", "processed_at"]
+
+    def validate(self, attrs):
+        order = attrs.get("order", getattr(self.instance, "order", None))
+        amount = attrs.get("amount", getattr(self.instance, "amount", None))
+        if order and amount:
+            refunded = order.refunds.exclude(pk=getattr(self.instance, "pk", None)).filter(status__in=[Refund.Status.APPROVED, Refund.Status.PAID]).aggregate(total=Sum("amount"))["total"] or 0
+            if amount + refunded > order.total:
+                raise serializers.ValidationError({"amount": "Le remboursement depasse le total de la commande."})
+        return attrs
 
 
 class HomepageBannerSerializer(serializers.ModelSerializer):
@@ -501,9 +636,39 @@ class HomepageBannerSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+class NewsletterSubscriberSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NewsletterSubscriber
+        fields = ["id", "email", "is_active", "created_at"]
+        read_only_fields = ["is_active", "created_at"]
+
+
 class AuditLogSerializer(serializers.ModelSerializer):
     actor_email = serializers.EmailField(source="actor.email", read_only=True)
 
     class Meta:
         model = AuditLog
         fields = ["id", "actor_email", "action", "entity", "entity_id", "before", "after", "ip_address", "created_at"]
+
+
+class SupplierProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SupplierProduct
+        fields = "__all__"
+
+
+class SupplierSerializer(serializers.ModelSerializer):
+    product_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = Supplier
+        fields = "__all__"
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    created_by_email = serializers.EmailField(source="created_by.email", read_only=True)
+
+    class Meta:
+        model = Expense
+        fields = "__all__"
+        read_only_fields = ["created_by"]

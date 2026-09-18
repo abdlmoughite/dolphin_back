@@ -21,7 +21,6 @@ from .models import (
     OrderStatusHistory,
     Payment,
     Product,
-    StockMovement,
 )
 
 
@@ -39,7 +38,12 @@ VALID_TRANSITIONS = {
 
 def get_or_create_cart(request):
     if request.user.is_authenticated:
-        cart, _ = Cart.objects.get_or_create(user=request.user, is_active=True, defaults={"session_key": ""})
+        carts = Cart.objects.filter(user=request.user, is_active=True).order_by("-updated_at", "-id")
+        cart = carts.first()
+        if cart:
+            carts.exclude(pk=cart.pk).update(is_active=False)
+        else:
+            cart = Cart.objects.create(user=request.user, is_active=True, session_key="")
         session_key = request.headers.get("X-Session-Key")
         if session_key:
             anon = Cart.objects.filter(session_key=session_key, user__isnull=True, is_active=True).first()
@@ -50,7 +54,12 @@ def get_or_create_cart(request):
     if not session_key:
         request.session.create()
         session_key = request.session.session_key
-    cart, _ = Cart.objects.get_or_create(session_key=session_key, user__isnull=True, is_active=True)
+    carts = Cart.objects.filter(session_key=session_key, user__isnull=True, is_active=True).order_by("-updated_at", "-id")
+    cart = carts.first()
+    if cart:
+        carts.exclude(pk=cart.pk).update(is_active=False)
+    else:
+        cart = Cart.objects.create(session_key=session_key, is_active=True)
     return cart
 
 
@@ -66,15 +75,19 @@ def merge_carts(source, target):
     source.save(update_fields=["is_active"])
 
 
-def cart_totals(cart):
+def cart_totals(cart, guest_email=""):
     subtotal = Decimal("0.00")
-    for item in cart.items.filter(saved_for_later=False).select_related("variant__product"):
-        subtotal += item.variant.price * item.quantity
-    discount = coupon_discount(cart.coupon, subtotal, cart.user) if cart.coupon else Decimal("0.00")
+    for item in cart.items.filter(saved_for_later=False).select_related("product", "variant__product"):
+        product = item.variant.product if item.variant else item.product
+        if not product:
+            continue
+        unit_price = item.variant.price if item.variant else product.current_price
+        subtotal += unit_price * item.quantity
+    discount = coupon_discount(cart.coupon, subtotal, cart.user, guest_email) if cart.coupon else Decimal("0.00")
     return {"subtotal": subtotal, "discount_total": discount, "total": max(subtotal - discount, Decimal("0.00"))}
 
 
-def coupon_discount(coupon, subtotal, user=None):
+def coupon_discount(coupon, subtotal, user=None, guest_email=""):
     if not coupon or not coupon.is_valid_now():
         raise ValidationError({"coupon": "Ce coupon n'est plus valide."})
     if subtotal < coupon.minimum_amount:
@@ -86,6 +99,12 @@ def coupon_discount(coupon, subtotal, user=None):
             raise ValidationError({"coupon": "Ce coupon est reserve a la premiere commande."})
         if coupon.usages.filter(user=user).count() >= coupon.max_usage_per_customer:
             raise ValidationError({"coupon": "Vous avez deja utilise ce coupon."})
+    elif guest_email:
+        normalized_email = guest_email.strip().lower()
+        if coupon.first_order_only and Order.objects.filter(guest_email__iexact=normalized_email).exists():
+            raise ValidationError({"coupon": "Ce coupon est reserve a la premiere commande."})
+        if coupon.usages.filter(guest_email__iexact=normalized_email).count() >= coupon.max_usage_per_customer:
+            raise ValidationError({"coupon": "Vous avez deja utilise ce coupon."})
     if coupon.discount_type == Coupon.DiscountType.PERCENT:
         return (subtotal * coupon.value / Decimal("100.00")).quantize(Decimal("0.01"))
     if coupon.discount_type == Coupon.DiscountType.FIXED:
@@ -94,17 +113,21 @@ def coupon_discount(coupon, subtotal, user=None):
 
 
 @transaction.atomic
-def add_cart_item(cart, variant, quantity):
-    inventory = Inventory.objects.select_for_update().get(variant=variant)
-    existing = CartItem.objects.filter(cart=cart, variant=variant, saved_for_later=False).first()
-    requested = quantity + (existing.quantity if existing else 0)
-    if inventory.available_quantity < requested:
-        raise ValidationError({"quantity": "Stock insuffisant pour cette quantite."})
+def add_cart_item(cart, variant=None, product=None, quantity=1):
+    if variant and not product:
+        product = variant.product
+    filters = {"cart": cart, "saved_for_later": False}
+    if variant:
+        filters["variant"] = variant
+    else:
+        filters["product"] = product
+        filters["variant__isnull"] = True
+    existing = CartItem.objects.filter(**filters).first()
     if existing:
-        existing.quantity = requested
+        existing.quantity = quantity + existing.quantity
         existing.save(update_fields=["quantity"])
         return existing
-    return CartItem.objects.create(cart=cart, variant=variant, quantity=quantity)
+    return CartItem.objects.create(cart=cart, product=product, variant=variant, quantity=quantity)
 
 
 def apply_coupon(cart, code):
@@ -126,13 +149,22 @@ def authenticated_user(user):
 @transaction.atomic
 def checkout(user, cart, data):
     customer_user = authenticated_user(user)
-    guest_email = data.get("guest_email", "").strip()
+    guest_email = data.get("guest_email", "").strip().lower()
+    idempotency_key = data.get("idempotency_key", "").strip()
+    if idempotency_key:
+        existing = Order.objects.select_for_update().filter(idempotency_key=idempotency_key).first()
+        if existing:
+            return existing
     if not customer_user and not guest_email:
         raise ValidationError({"guest_email": "Email requis pour commander sans compte."})
 
-    items = list(cart.items.filter(saved_for_later=False).select_related("variant__product", "variant__inventory"))
+    items = list(cart.items.filter(saved_for_later=False).select_related("product__category", "variant__product__category"))
     if not items:
         raise ValidationError({"cart": "Votre panier est vide."})
+    for item in items:
+        product = item.variant.product if item.variant else item.product
+        if not product or product.status != Product.Status.ACTIVE or not product.category.is_active or product.category.is_archived:
+            raise ValidationError({"cart": f"{product.name if product else 'Produit'} n'est plus disponible."})
 
     zone = DeliveryZone.objects.select_for_update().get(pk=data["delivery_zone_id"], is_active=True)
     if data["payment_method"] == Order.PaymentMethod.COD and not zone.cash_on_delivery_available:
@@ -148,21 +180,9 @@ def checkout(user, cart, data):
         if missing:
             raise ValidationError({field: "Champ requis pour commander sans adresse enregistree." for field in missing})
 
-    totals = cart_totals(cart)
-    shipping = zone.shipping_price
-    if zone.free_delivery_threshold and totals["subtotal"] >= zone.free_delivery_threshold:
-        shipping = Decimal("0.00")
-    if cart.coupon and cart.coupon.discount_type == Coupon.DiscountType.FREE_DELIVERY:
-        shipping = Decimal("0.00")
+    totals = cart_totals(cart, guest_email=guest_email)
+    shipping = Decimal("0.00")
     total = totals["total"] + shipping
-
-    for item in items:
-        inventory = Inventory.objects.select_for_update().get(variant=item.variant)
-        if inventory.available_quantity < item.quantity:
-            raise ValidationError({"stock": f"Stock insuffisant pour {item.variant.product.name}."})
-        inventory.quantity = F("quantity") - item.quantity
-        inventory.save(update_fields=["quantity"])
-        StockMovement.objects.create(variant=item.variant, movement_type=StockMovement.Type.OUT, quantity=-item.quantity, reason="Commande", actor=customer_user)
 
     order = Order.objects.create(
         user=customer_user,
@@ -172,29 +192,32 @@ def checkout(user, cart, data):
         shipping_full_name=(address.full_name if address else data.get("shipping_full_name", f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip())),
         shipping_phone=(address.phone if address else data.get("shipping_phone", getattr(user, "phone", ""))),
         shipping_address=(address.address_line1 if address else data.get("shipping_address", "")),
-        shipping_city=zone.city,
+        shipping_city=data.get("shipping_city", zone.city),
         subtotal=totals["subtotal"],
         discount_total=totals["discount_total"],
         shipping_total=shipping,
         tax_total=Decimal("0.00"),
         total=total,
         coupon_code=cart.coupon.code if cart.coupon else "",
+        idempotency_key=idempotency_key or None,
         customer_note=data.get("customer_note", ""),
     )
     for item in items:
-        values = ", ".join(item.variant.values.values_list("value", flat=True))
+        product = item.variant.product if item.variant else item.product
+        values = ", ".join(item.variant.values.values_list("value", flat=True)) if item.variant else ""
+        unit_price = item.variant.price if item.variant else product.current_price
         OrderItem.objects.create(
             order=order,
-            product=item.variant.product,
+            product=product,
             variant=item.variant,
-            product_name=item.variant.product.name,
+            product_name=product.name,
             variant_label=values,
-            sku=item.variant.sku,
-            unit_price=item.variant.price,
+            sku=item.variant.sku if item.variant else product.sku,
+            unit_price=unit_price,
             quantity=item.quantity,
-            total=item.variant.price * item.quantity,
+            total=unit_price * item.quantity,
         )
-        Product.objects.filter(pk=item.variant.product_id).update(sales_count=F("sales_count") + item.quantity)
+        Product.objects.filter(pk=product.id).update(sales_count=F("sales_count") + item.quantity)
     Payment.objects.create(order=order, method=data["payment_method"], amount=total, status="PENDING")
     OrderStatusHistory.objects.create(order=order, to_status=order.status, actor=customer_user, note="Commande creee")
     if cart.coupon:
@@ -208,8 +231,11 @@ def checkout(user, cart, data):
 
 
 @transaction.atomic
-def transition_order(order, new_status, actor, note=""):
-    if new_status not in VALID_TRANSITIONS.get(order.status, set()):
+def transition_order(order, new_status, actor, note="", force=False):
+    valid_statuses = {choice[0] for choice in Order.Status.choices}
+    if new_status not in valid_statuses:
+        raise ValidationError({"status": "Statut de commande inconnu."})
+    if not force and new_status not in VALID_TRANSITIONS.get(order.status, set()):
         raise ValidationError({"status": "Transition de statut non autorisee."})
     previous = order.status
     order.status = new_status
@@ -236,6 +262,7 @@ def dashboard_metrics():
         "pending_orders": Order.objects.filter(status=Order.Status.PENDING).count(),
         "delivered_orders": delivered.count(),
         "cancelled_orders": Order.objects.filter(status=Order.Status.CANCELLED).count(),
+        "active_products": Product.objects.filter(status=Product.Status.ACTIVE).count(),
         "average_order_value": revenue / total_orders if total_orders else Decimal("0.00"),
         "low_stock_products": Inventory.objects.filter(quantity__lte=F("variant__product__low_stock_threshold")).count(),
         "out_of_stock_products": Inventory.objects.filter(quantity=0).count(),

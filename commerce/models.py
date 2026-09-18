@@ -333,12 +333,10 @@ class Cart(TimeStampedModel):
 
 class CartItem(TimeStampedModel):
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items")
-    variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, blank=True, null=True)
+    variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT, blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
     saved_for_later = models.BooleanField(default=False)
-
-    class Meta:
-        unique_together = ("cart", "variant", "saved_for_later")
 
 
 class DeliveryZone(TimeStampedModel):
@@ -383,6 +381,7 @@ class Order(TimeStampedModel):
     tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     total = models.DecimalField(max_digits=12, decimal_places=2)
     coupon_code = models.CharField(max_length=40, blank=True)
+    idempotency_key = models.CharField(max_length=80, blank=True, null=True, unique=True, db_index=True)
     customer_note = models.TextField(blank=True)
     internal_note = models.TextField(blank=True)
     tracking_number = models.CharField(max_length=80, blank=True)
@@ -395,8 +394,8 @@ class Order(TimeStampedModel):
 
 class OrderItem(TimeStampedModel):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="items")
-    product = models.ForeignKey(Product, on_delete=models.PROTECT)
-    variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT)
+    product = models.ForeignKey(Product, on_delete=models.SET_NULL, blank=True, null=True)
+    variant = models.ForeignKey(ProductVariant, on_delete=models.SET_NULL, blank=True, null=True)
     product_name = models.CharField(max_length=220)
     variant_label = models.CharField(max_length=220, blank=True)
     sku = models.CharField(max_length=90)
@@ -421,6 +420,23 @@ class Payment(TimeStampedModel):
     reference = models.CharField(max_length=120, blank=True)
 
 
+class Refund(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "En attente"
+        APPROVED = "APPROVED", "Approuve"
+        REJECTED = "REJECTED", "Rejete"
+        PAID = "PAID", "Verse"
+
+    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="refunds")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    method = models.CharField(max_length=80)
+    reference = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    reason = models.CharField(max_length=255, blank=True)
+    processed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True)
+    processed_at = models.DateTimeField(blank=True, null=True)
+
+
 class Shipment(TimeStampedModel):
     order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name="shipment")
     carrier = models.CharField(max_length=100, blank=True)
@@ -430,16 +446,34 @@ class Shipment(TimeStampedModel):
 
 
 class ReturnRequest(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "En attente"
+        APPROVED = "APPROVED", "Accepte"
+        REJECTED = "REJECTED", "Rejete"
+        REPLACED = "REPLACED", "Remplace"
+        REFUNDED = "REFUNDED", "Rembourse"
+
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="returns")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     reason = models.TextField()
-    status = models.CharField(max_length=30, default="PENDING")
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.PENDING)
+    admin_decision = models.TextField(blank=True)
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True, related_name="return_decisions")
+    decided_at = models.DateTimeField(blank=True, null=True)
 
 
 class ReturnItem(TimeStampedModel):
     return_request = models.ForeignKey(ReturnRequest, on_delete=models.CASCADE, related_name="items")
     order_item = models.ForeignKey(OrderItem, on_delete=models.PROTECT)
     quantity = models.PositiveIntegerField(default=1)
+
+
+class ReturnHistory(TimeStampedModel):
+    return_request = models.ForeignKey(ReturnRequest, on_delete=models.CASCADE, related_name="history")
+    from_status = models.CharField(max_length=30, blank=True)
+    to_status = models.CharField(max_length=30)
+    note = models.CharField(max_length=255, blank=True)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True)
 
 
 class CustomerNotification(TimeStampedModel):
@@ -565,6 +599,20 @@ class SupplierProduct(TimeStampedModel):
 
     class Meta:
         unique_together = ("supplier", "external_product_id")
+
+
+class Expense(TimeStampedModel):
+    category = models.CharField(max_length=120, db_index=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    date = models.DateField(db_index=True)
+    supplier = models.ForeignKey(Supplier, on_delete=models.SET_NULL, blank=True, null=True, related_name="expenses")
+    reference = models.CharField(max_length=120, blank=True)
+    receipt = models.FileField(upload_to="expenses/", blank=True, null=True)
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True, related_name="expenses_created")
+
+    class Meta:
+        ordering = ["-date", "-created_at"]
 
 
 def ensure_slug(instance, source="name"):

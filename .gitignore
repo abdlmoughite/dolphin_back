@@ -1,0 +1,13 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+db.sqlite3
+*.sqlite3
+media/products/
+media/tmp/
+media/uploads/
+media/local/
+media_e2e/
+test_media/
+tmp/

@@ -10,6 +10,7 @@ from .models import (
     Coupon,
     CustomerAddress,
     DeliveryZone,
+    Expense,
     HomepageBanner,
     Inventory,
     Order,
@@ -22,6 +23,9 @@ from .models import (
     ProductReview,
     ProductVariant,
     Promotion,
+    Refund,
+    ReturnHistory,
+    ReturnRequest,
     SupportTicket,
     Supplier,
     SupplierProduct,
@@ -97,9 +101,13 @@ admin.site.register(Promotion)
 admin.site.register(DeliveryZone)
 admin.site.register(ProductReview)
 admin.site.register(SupportTicket)
+admin.site.register(ReturnRequest)
+admin.site.register(ReturnHistory)
+admin.site.register(Refund)
 admin.site.register(HomepageBanner)
 admin.site.register(AuditLog)
 admin.site.register(ProductImportJob)
 admin.site.register(ProductImportRow)
 admin.site.register(Supplier)
 admin.site.register(SupplierProduct)
+admin.site.register(Expense)

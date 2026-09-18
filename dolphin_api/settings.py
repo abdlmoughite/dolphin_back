@@ -107,7 +107,7 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_ROOT = Path(config("MEDIA_ROOT", default=str(BASE_DIR / "media")))
 SERVE_MEDIA_FILES = env_bool("SERVE_MEDIA_FILES", True)
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
@@ -131,7 +131,12 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.UserRateThrottle",
         "commerce.throttles.AuthThrottle",
     ],
-    "DEFAULT_THROTTLE_RATES": {"anon": "200/hour", "user": "1000/hour", "auth": "10/minute", "coupon": "20/hour"},
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": config("DRF_ANON_RATE", default="200/hour"),
+        "user": config("DRF_USER_RATE", default="1000/hour"),
+        "auth": config("DRF_AUTH_RATE", default="10/minute"),
+        "coupon": config("DRF_COUPON_RATE", default="20/hour"),
+    },
 }
 
 SIMPLE_JWT = {
