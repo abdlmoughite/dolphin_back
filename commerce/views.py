@@ -143,6 +143,193 @@ def simple_pdf_response(filename, lines):
     return response
 
 
+def pdf_escape(value):
+    return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def money_dh(value):
+    amount = Decimal(value or "0.00")
+    if amount == amount.to_integral():
+        return f"{amount:.0f} Dh"
+    return f"{amount:.2f} Dh"
+
+
+def invoice_number(order):
+    digits = "".join(char for char in str(order.pk) if char.isdigit())[-3:] or "001"
+    return f"026.DLP.{digits.zfill(3)}.FAC.001"
+
+
+def truncated_text(value, limit=42):
+    text = str(value or "").strip()
+    return text if len(text) <= limit else f"{text[: max(limit - 3, 0)]}..."
+
+
+def dolphin_invoice_pdf_response(order):
+    width = 595
+    commands = []
+
+    def line_width(size):
+        commands.append(f"{size} w")
+
+    def stroke_color(gray):
+        commands.append(f"{gray} G")
+
+    def fill_color(gray):
+        commands.append(f"{gray} g")
+
+    def fill_rgb(r, g, b):
+        commands.append(f"{r} {g} {b} rg")
+
+    def rect(x, y, w, h, fill=False):
+        commands.append(f"{x:.2f} {y:.2f} {w:.2f} {h:.2f} re {'f' if fill else 'S'}")
+
+    def line(x1, y1, x2, y2):
+        commands.append(f"{x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+
+    def text(x, y, value, size=8, font="F1", align="left"):
+        safe = pdf_escape(value)
+        approx_width = len(str(value)) * size * 0.48
+        if align == "center":
+            x -= approx_width / 2
+        elif align == "right":
+            x -= approx_width
+        commands.append(f"BT /{font} {size} Tf {x:.2f} {y:.2f} Td ({safe}) Tj ET")
+
+    line_width(0.7)
+    stroke_color(0)
+
+    logo_path = settings.BASE_DIR.parent / "frontend" / "src" / "assets" / "dolphin-logo.jpeg"
+    logo_data = None
+    logo_size = None
+    if logo_path.exists():
+        logo_data = logo_path.read_bytes()
+        with Image.open(logo_path) as logo:
+            logo_size = logo.size
+        commands.append("q 170 0 0 50 24 752 cm /Logo Do Q")
+    else:
+        text(30, 770, "DOLPHIN", 26, "F2")
+        commands.append("84 781 m 93 790 l 101 780 l 93 772 l h f")
+    text(410, 770, "FACTURE", 30, "F2", "center")
+
+    info_x, info_y, info_w, row_h = 221, 650, 339, 18
+    fill_rgb(0.73, 0.80, 0.91)
+    rect(info_x, info_y + row_h * 4, info_w, row_h, True)
+    fill_color(0)
+    rect(info_x, info_y, info_w, row_h * 5)
+    for index in range(1, 5):
+        line(info_x, info_y + row_h * index, info_x + info_w, info_y + row_h * index)
+    line(info_x + 118, info_y, info_x + 118, info_y + row_h * 4)
+    text(info_x + info_w / 2, info_y + row_h * 4 + 6, f"Facture N : {invoice_number(order)}", 7, "F2", "center")
+    info_rows = [
+        ("Nom de client", order.shipping_full_name),
+        ("Telephone", order.shipping_phone),
+        ("Adresse postale", f"{order.shipping_address}, {order.shipping_city}".strip(", ")),
+        ("Date de commande", timezone.localtime(order.created_at).strftime("%d / %m / %Y")),
+    ]
+    for index, (label, value) in enumerate(info_rows):
+        y = info_y + row_h * (3 - index) + 6
+        text(info_x + 7, y, label, 7, "F2")
+        text(info_x + 126, y, truncated_text(value, 50), 6.5)
+
+    meta_x, meta_y, meta_w, meta_h = 9, 613, 551, 32
+    rect(meta_x, meta_y, meta_w, meta_h)
+    col_widths = [112, 110, 112, 132, 85]
+    fill_rgb(0.73, 0.80, 0.91)
+    rect(meta_x, meta_y + 16, meta_w, 16, True)
+    fill_color(0)
+    rect(meta_x, meta_y, meta_w, meta_h)
+    cursor = meta_x
+    for col_w in col_widths[:-1]:
+        cursor += col_w
+        line(cursor, meta_y, cursor, meta_y + meta_h)
+    line(meta_x, meta_y + 16, meta_x + meta_w, meta_y + 16)
+    meta_headers = ["N devis", "Mode Reglement", "Ref Reglement", "Mode Livraison", "Page N"]
+    meta_values = [order.order_number, "Cash", invoice_number(order), "Livraison Standard", "1/1"]
+    centers = []
+    cursor = meta_x
+    for col_w in col_widths:
+        centers.append(cursor + col_w / 2)
+        cursor += col_w
+    for index, header in enumerate(meta_headers):
+        text(centers[index], meta_y + 21.5, header, 7, "F2", "center")
+        text(centers[index], meta_y + 5.5, meta_values[index], 6.3, align="center")
+
+    table_x, table_y, table_w, table_h = 9, 206, 551, 390
+    header_h = 17
+    fill_rgb(0.73, 0.80, 0.91)
+    rect(table_x, table_y + table_h - header_h, table_w, header_h, True)
+    fill_color(0)
+    rect(table_x, table_y, table_w, table_h)
+    line(table_x, table_y + table_h - header_h, table_x + table_w, table_y + table_h - header_h)
+    table_cols = [112, 203, 86, 72, 78]
+    cursor = table_x
+    for col_w in table_cols[:-1]:
+        cursor += col_w
+        line(cursor, table_y, cursor, table_y + table_h)
+    headers = ["Article", "Designation", "Quantite", "Prix", "Total HT"]
+    cursor = table_x
+    for index, col_w in enumerate(table_cols):
+        text(cursor + col_w / 2, table_y + table_h - 11, headers[index], 7, "F2", "center")
+        cursor += col_w
+    row_y = table_y + table_h - header_h - 29
+    for item in order.items.all():
+        text(table_x + 8, row_y, truncated_text(item.product_name, 17), 8)
+        designation = item.variant_label or item.sku or item.product_name
+        text(table_x + table_cols[0] + 8, row_y, truncated_text(designation, 39), 8)
+        text(table_x + sum(table_cols[:2]) + table_cols[2] / 2, row_y, str(item.quantity).zfill(2), 8, align="center")
+        text(table_x + sum(table_cols[:3]) + table_cols[3] / 2, row_y, money_dh(item.unit_price).replace(" Dh", ""), 8, align="center")
+        text(table_x + sum(table_cols[:4]) + table_cols[4] / 2, row_y, money_dh(item.total).replace(" Dh", ""), 8, align="center")
+        row_y -= 17
+        if row_y < table_y + 12:
+            break
+
+    totals_x, totals_y, totals_w, totals_h = 309, 124, 251, 54
+    rect(totals_x, totals_y, totals_w, totals_h)
+    line(totals_x, totals_y + 18, totals_x + totals_w, totals_y + 18)
+    line(totals_x, totals_y + 36, totals_x + totals_w, totals_y + 36)
+    line(totals_x + 96, totals_y, totals_x + 96, totals_y + totals_h)
+    totals = [("TVA", "0%"), ("TTC", money_dh(order.total)), ("TOTAL", money_dh(order.total))]
+    for index, (label, value) in enumerate(totals):
+        y = totals_y + totals_h - 13 - index * 18
+        text(totals_x + 48, y, label, 8, "F2", "center")
+        text(totals_x + 171, y, value, 8, "F2", "center")
+
+    text(width / 2, 58, "DOLPHIN.ma", 9, "F2", "center")
+    text(width / 2, 43, "Tel : 06-63-33-61-88 / R.S : DOLPHIN.OFFICIEL / CASABLANCA - MAROC", 7.5, "F2", "center")
+
+    stream = "\n".join(commands).encode("latin-1", errors="replace")
+    content_object_number = 7 if logo_data and logo_size else 6
+    xobject_resource = " /XObject << /Logo 6 0 R >>" if logo_data and logo_size else ""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 5 0 R >>{xobject_resource} >> /Contents {content_object_number} 0 R >>".encode(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+    ]
+    if logo_data and logo_size:
+        logo_width, logo_height = logo_size
+        objects.append(
+            f"<< /Type /XObject /Subtype /Image /Width {logo_width} /Height {logo_height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {len(logo_data)} >>\nstream\n".encode()
+            + logo_data
+            + b"\nendstream"
+        )
+    objects.append(b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream")
+    body = b"%PDF-1.4\n"
+    offsets = [0]
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(body))
+        body += f"{number} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_start = len(body)
+    body += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for offset in offsets[1:]:
+        body += f"{offset:010d} 00000 n \n".encode()
+    body += f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode()
+    response = HttpResponse(body, content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="facture-{order.order_number}.pdf"'
+    return response
+
+
 class DolphinTokenObtainPairView(TokenObtainPairView):
     serializer_class = DolphinTokenObtainPairSerializer
     throttle_scope = "auth"
@@ -596,7 +783,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = Order.objects.select_related("user", "delivery_zone").prefetch_related("items", "status_history", "refunds").order_by("-created_at")
-        if self.request.user.role == User.Role.CUSTOMER:
+        if getattr(self.request.user, "role", None) == User.Role.CUSTOMER:
             qs = qs.filter(user=self.request.user)
         date_from = self.request.query_params.get("date_from")
         date_to = self.request.query_params.get("date_to")
@@ -646,31 +833,16 @@ class OrderViewSet(viewsets.ModelViewSet):
             order.save(update_fields=["internal_note", "updated_at"])
         return Response(OrderSerializer(order).data)
 
-    @action(detail=True, methods=["get"], permission_classes=[IsOrderManager])
+    @action(detail=True, methods=["get"], permission_classes=[AllowAny])
     def invoice(self, request, pk=None):
         order = self.get_object()
-        lines = [
-            "DOLPHIN - Facture",
-            f"Commande: {order.order_number}",
-            f"Date: {timezone.localtime(order.created_at):%Y-%m-%d %H:%M}",
-            f"Client: {order.shipping_full_name}",
-            f"Email: {order.guest_email or getattr(order.user, 'email', '')}",
-            f"Adresse: {order.shipping_address}, {order.shipping_city}",
-            "",
-            "Articles:",
-        ]
-        for item in order.items.all():
-            lines.append(f"- {item.product_name} {item.variant_label} x{item.quantity}: {item.total} MAD")
-        lines += [
-            "",
-            f"Sous-total: {order.subtotal} MAD",
-            f"Remise: {order.discount_total} MAD",
-            "Livraison: Gratuite",
-            f"Total: {order.total} MAD",
-            f"Paiement: {order.payment_method}",
-        ]
-        AuditLog.objects.create(actor=request.user, action="INVOICE_DOWNLOADED", entity="Order", entity_id=str(order.pk), ip_address=client_ip(request))
-        return simple_pdf_response(f"facture-{order.order_number}.pdf", lines)
+        is_order_manager = request.user.is_authenticated and request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER, User.Role.ORDER_OPERATOR}
+        is_owner = request.user.is_authenticated and order.user_id == request.user.id
+        invoice_key = request.query_params.get("key", "")
+        if not (is_order_manager or is_owner or (order.idempotency_key and invoice_key == order.idempotency_key)):
+            return Response({"detail": "Cle facture invalide."}, status=403)
+        AuditLog.objects.create(actor=request.user if request.user.is_authenticated else None, action="INVOICE_DOWNLOADED", entity="Order", entity_id=str(order.pk), ip_address=client_ip(request))
+        return dolphin_invoice_pdf_response(order)
 
     @action(detail=True, methods=["patch"], permission_classes=[IsOrderManager])
     def update_details(self, request, pk=None):

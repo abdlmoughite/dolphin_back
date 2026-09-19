@@ -331,6 +331,35 @@ class CommerceApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    def test_checkout_accepts_free_city_and_product_without_variant(self):
+        product = Product.objects.create(
+            name="Montre sans variante",
+            sku="WATCH-NOVAR",
+            category=self.category,
+            brand=self.brand,
+            regular_price=Decimal("199.00"),
+            status=Product.Status.ACTIVE,
+        )
+        headers = {"HTTP_X_SESSION_KEY": "free-city-checkout"}
+        response = self.client.post("/api/v1/cart/add/", {"product_id": product.id, "quantity": 1}, **headers)
+        self.assertEqual(response.status_code, 201, response.data)
+        response = self.client.post(
+            "/api/v1/checkout/",
+            {
+                "guest_email": "free-city@test.local",
+                "shipping_full_name": "Client Libre",
+                "shipping_phone": "0665113076",
+                "shipping_address": "DB KOUDIA RUE MOHAMED BOUAFI NR 192 CD CASA",
+                "shipping_city": "casablanca",
+                "payment_method": "COD",
+            },
+            **headers,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["shipping_city"], "casablanca")
+        self.assertEqual(response.data["items"][0]["product_name"], product.name)
+        self.assertEqual(response.data["items"][0]["variant"], None)
+
     def test_category_deactivation_keeps_order_history_and_reactivation_restores_products(self):
         order = Order.objects.create(
             user=self.customer,
@@ -861,10 +890,15 @@ class CommerceApiTests(TestCase):
             subtotal=Decimal("100.00"),
             shipping_total=Decimal("25.00"),
             total=Decimal("125.00"),
+            idempotency_key="invoice-key-1",
         )
         OrderItem.objects.create(order=order, product=self.product, variant=self.variant, product_name=self.product.name, sku=self.variant.sku, unit_price=Decimal("100.00"), quantity=1, total=Decimal("100.00"))
         response = self.client.get(f"/api/v1/orders/{order.id}/invoice/")
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 403)
+        response = self.client.get(f"/api/v1/orders/{order.id}/invoice/?key=invoice-key-1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertTrue(response.content.startswith(b"%PDF"))
         self.login(self.admin)
         response = self.client.get(f"/api/v1/orders/{order.id}/invoice/")
         self.assertEqual(response.status_code, 200)

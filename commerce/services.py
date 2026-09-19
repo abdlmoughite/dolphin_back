@@ -167,7 +167,13 @@ def checkout(user, cart, data):
         if not product or product.status != Product.Status.ACTIVE or not product.category.is_active or product.category.is_archived:
             raise ValidationError({"cart": f"{product.name if product else 'Produit'} n'est plus disponible."})
 
-    zone = DeliveryZone.objects.select_for_update().get(pk=data["delivery_zone_id"], is_active=True)
+    zone_id = data.get("delivery_zone_id")
+    if zone_id:
+        zone = DeliveryZone.objects.select_for_update().get(pk=zone_id, is_active=True)
+    else:
+        zone = DeliveryZone.objects.select_for_update().filter(is_active=True).order_by("city", "id").first()
+    if not zone:
+        zone = DeliveryZone.objects.create(city=data.get("shipping_city", "Autre") or "Autre", shipping_price=Decimal("0.00"), is_active=True)
     if data["payment_method"] == Order.PaymentMethod.COD and not zone.cash_on_delivery_available:
         raise ValidationError({"payment_method": "Paiement a la livraison indisponible dans cette ville."})
 

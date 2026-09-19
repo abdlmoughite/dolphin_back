@@ -516,7 +516,7 @@ class CheckoutSerializer(serializers.Serializer):
     shipping_phone = serializers.CharField(max_length=20, required=False)
     shipping_address = serializers.CharField(max_length=300, required=False)
     shipping_city = serializers.CharField(max_length=120)
-    delivery_zone_id = serializers.IntegerField()
+    delivery_zone_id = serializers.IntegerField(required=False)
     payment_method = serializers.ChoiceField(choices=Order.PaymentMethod.choices)
     customer_note = serializers.CharField(required=False, allow_blank=True)
 
