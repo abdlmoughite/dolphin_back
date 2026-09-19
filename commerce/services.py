@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import datetime, time
 
 from django.core.mail import send_mail
 from django.db import transaction
@@ -250,9 +251,12 @@ def transition_order(order, new_status, actor, note="", force=False):
 def dashboard_metrics():
     today = timezone.localdate()
     month_start = today.replace(day=1)
+    today_start = timezone.make_aware(datetime.combine(today, time.min))
+    today_end = timezone.make_aware(datetime.combine(today, time.max))
+    month_start_dt = timezone.make_aware(datetime.combine(month_start, time.min))
     delivered = Order.objects.filter(status=Order.Status.DELIVERED)
-    today_revenue = delivered.filter(updated_at__date=today).aggregate(total=Sum("total"))["total"] or Decimal("0.00")
-    month_revenue = delivered.filter(updated_at__date__gte=month_start).aggregate(total=Sum("total"))["total"] or Decimal("0.00")
+    today_revenue = delivered.filter(updated_at__gte=today_start, updated_at__lte=today_end).aggregate(total=Sum("total"))["total"] or Decimal("0.00")
+    month_revenue = delivered.filter(updated_at__gte=month_start_dt).aggregate(total=Sum("total"))["total"] or Decimal("0.00")
     total_orders = Order.objects.count()
     revenue = delivered.aggregate(total=Sum("total"))["total"] or Decimal("0.00")
     return {

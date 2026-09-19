@@ -20,7 +20,6 @@ from .models import (
     ProductImage,
     ProductImportJob,
     ProductImportRow,
-    ProductReview,
     ProductVariant,
     Promotion,
     Refund,
@@ -99,7 +98,6 @@ admin.site.register(Cart)
 admin.site.register(Coupon)
 admin.site.register(Promotion)
 admin.site.register(DeliveryZone)
-admin.site.register(ProductReview)
 admin.site.register(SupportTicket)
 admin.site.register(ReturnRequest)
 admin.site.register(ReturnHistory)

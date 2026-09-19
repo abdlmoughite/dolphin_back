@@ -2,7 +2,7 @@ import csv
 import platform
 import sys
 from decimal import Decimal
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from io import BytesIO
 
 import django
@@ -13,9 +13,10 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
 from django.db import connection, transaction
 from django.db.models import F
-from django.db.models import Avg, Count, Q, Sum
+from django.db.models import Count, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import FileResponse, HttpResponse
+from django.utils.dateparse import parse_date
 from django.utils import timezone
 from django_filters.rest_framework import FilterSet, NumberFilter
 from rest_framework import status, viewsets
@@ -38,14 +39,16 @@ from .models import (
     DeliveryZone,
     Expense,
     HomepageBanner,
+    HomeSection,
     Inventory,
     NewsletterSubscriber,
     Order,
+    OrderItem,
+    OrderStatusHistory,
     Product,
     ProductImage,
     ProductVariant,
     ProductImportJob,
-    ProductReview,
     Promotion,
     Refund,
     ReturnHistory,
@@ -78,9 +81,9 @@ from .serializers import (
     ExpenseSerializer,
     RefundSerializer,
     HomepageBannerSerializer,
+    HomeSectionSerializer,
     NewsletterSubscriberSerializer,
     OrderSerializer,
-    ProductReviewSerializer,
     ProductSerializer,
     ProductImportJobSerializer,
     PromotionSerializer,
@@ -322,15 +325,14 @@ class ProductFilter(FilterSet):
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = (
         Product.objects.select_related("category", "brand")
-        .prefetch_related("images", "variants__values", "variants__inventory", "reviews")
-        .annotate(average_rating=Avg("reviews__rating"))
+        .prefetch_related("images", "variants__values", "variants__inventory")
     )
     serializer_class = ProductSerializer
     permission_classes = [IsCatalogManagerOrReadOnly]
     lookup_field = "slug"
     filterset_class = ProductFilter
     search_fields = ["name", "sku", "short_description", "description", "brand__name", "category__name"]
-    ordering_fields = ["created_at", "regular_price", "view_count", "sales_count", "average_rating"]
+    ordering_fields = ["created_at", "regular_price", "view_count", "sales_count"]
     parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def get_serializer_class(self):
@@ -730,23 +732,6 @@ class WishlistViewSet(viewsets.ModelViewSet):
         serializer.save(wishlist=wishlist)
 
 
-class ReviewViewSet(viewsets.ModelViewSet):
-    serializer_class = ProductReviewSerializer
-    permission_classes = [IsAuthenticated]
-    filterset_fields = ["product", "status", "rating"]
-
-    def get_queryset(self):
-        qs = ProductReview.objects.select_related("user", "product").order_by("-created_at")
-        if self.request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER, User.Role.CUSTOMER_SUPPORT}:
-            return qs
-        return qs.filter(Q(user=self.request.user) | Q(status=ProductReview.Status.APPROVED))
-
-    def perform_create(self, serializer):
-        product = serializer.validated_data["product"]
-        eligible = Order.objects.filter(user=self.request.user, status=Order.Status.DELIVERED, items__product=product).exists()
-        serializer.save(user=self.request.user, verified_purchase=eligible)
-
-
 class PromotionViewSet(viewsets.ModelViewSet):
     queryset = Promotion.objects.all()
     serializer_class = PromotionSerializer
@@ -868,6 +853,26 @@ class HomepageBannerViewSet(viewsets.ModelViewSet):
     permission_classes = [IsCatalogManagerOrReadOnly]
 
 
+class HomeSectionViewSet(viewsets.ModelViewSet):
+    serializer_class = HomeSectionSerializer
+    permission_classes = [IsCatalogManagerOrReadOnly]
+    lookup_field = "key"
+    ordering_fields = ["display_order", "title"]
+
+    def get_queryset(self):
+        qs = HomeSection.objects.prefetch_related("products__category", "products__brand", "products__images", "products__variants__values").order_by("display_order", "title")
+        user = self.request.user
+        if self.request.query_params.get("public") == "true" or not (user.is_authenticated and user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
+            qs = qs.filter(is_visible=True)
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        section = self.get_object()
+        if section.products.exists():
+            return Response({"detail": "Retirez tous les produits de cette section avant de la supprimer."}, status=400)
+        return super().destroy(request, *args, **kwargs)
+
+
 class NewsletterSubscribeView(APIView):
     permission_classes = [AllowAny]
     throttle_scope = "auth"
@@ -903,7 +908,7 @@ class StaffViewSet(viewsets.ModelViewSet):
     ordering_fields = ["date_joined", "last_login", "email"]
 
     def get_queryset(self):
-        return get_user_model().objects.annotate(
+        return get_user_model().objects.exclude(role=User.Role.CUSTOMER).annotate(
             order_count=Count("orders", distinct=True),
             total_spent=Sum("orders__total"),
         ).order_by("-date_joined")
@@ -925,6 +930,8 @@ class StaffViewSet(viewsets.ModelViewSet):
         user = self.get_object()
         if user.pk == request.user.pk:
             return Response({"detail": "Vous ne pouvez pas supprimer votre propre compte."}, status=400)
+        if user.role == User.Role.SUPER_ADMIN and request.user.role != User.Role.SUPER_ADMIN:
+            return Response({"detail": "Seul un Developer peut supprimer un Developer."}, status=403)
         if user.role == User.Role.SUPER_ADMIN and get_user_model().objects.filter(role=User.Role.SUPER_ADMIN, status=User.Status.ACTIVE).count() <= 1:
             return Response({"detail": "Impossible de supprimer le dernier Developer actif."}, status=400)
         before = {"email": user.email, "role": user.role}
@@ -1094,24 +1101,115 @@ class DeveloperDashboardView(APIView):
     def get(self, request):
         today = timezone.localdate()
         month_start = today.replace(day=1)
+        date_from = parse_date(request.query_params.get("date_from") or "") or today - timedelta(days=13)
+        date_to = parse_date(request.query_params.get("date_to") or "") or today
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+        range_start = timezone.make_aware(datetime.combine(date_from, time.min))
+        range_end = timezone.make_aware(datetime.combine(date_to, time.max))
+        today_start = timezone.make_aware(datetime.combine(today, time.min))
+        today_end = timezone.make_aware(datetime.combine(today, time.max))
+        month_start_dt = timezone.make_aware(datetime.combine(month_start, time.min))
+
+        base_orders = Order.objects.select_related("user", "delivery_zone").filter(created_at__gte=range_start, created_at__lte=range_end)
+        city = str(request.query_params.get("city", "")).strip()
+        search = str(request.query_params.get("search", "")).strip()
+        status_filter = str(request.query_params.get("status", "")).strip()
+        if city:
+            base_orders = base_orders.filter(shipping_city__iexact=city)
+        if search:
+            base_orders = base_orders.filter(
+                Q(order_number__icontains=search)
+                | Q(shipping_full_name__icontains=search)
+                | Q(shipping_phone__icontains=search)
+                | Q(guest_email__icontains=search)
+                | Q(tracking_number__icontains=search)
+            )
+
+        delivered_events = OrderStatusHistory.objects.select_related("order").filter(created_at__gte=range_start, created_at__lte=range_end, to_status=Order.Status.DELIVERED)
+        if city:
+            delivered_events = delivered_events.filter(order__shipping_city__iexact=city)
+        if search:
+            delivered_events = delivered_events.filter(
+                Q(order__order_number__icontains=search)
+                | Q(order__shipping_full_name__icontains=search)
+                | Q(order__shipping_phone__icontains=search)
+                | Q(order__guest_email__icontains=search)
+                | Q(order__tracking_number__icontains=search)
+            )
+
+        status_breakdown_qs = base_orders.values("status").annotate(total=Count("id")).order_by("status")
+        filtered_orders = base_orders
+        if status_filter:
+            filtered_orders = filtered_orders.filter(status=status_filter)
+            if status_filter != Order.Status.DELIVERED:
+                delivered_events = delivered_events.none()
+
         delivered = Order.objects.filter(status=Order.Status.DELIVERED)
-        orders_by_status = dict(Order.objects.values_list("status").annotate(total=Count("id")))
+        orders_by_status = {row["status"]: row["total"] for row in status_breakdown_qs}
+        total_filtered = filtered_orders.count()
+        delivered_order_ids = list(delivered_events.values_list("order_id", flat=True).distinct())
+        delivered_count = len(delivered_order_ids)
+        cancelled_count = filtered_orders.filter(status=Order.Status.CANCELLED).count()
+        active_for_rate = max(total_filtered - cancelled_count, delivered_count + cancelled_count)
+        delivery_rate = (delivered_count / active_for_rate * 100) if active_for_rate else 0
+        filtered_revenue = Order.objects.filter(pk__in=delivered_order_ids).aggregate(total=Sum("total"))["total"] or Decimal("0.00")
+        filtered_expenses = Expense.objects.filter(date__gte=date_from, date__lte=date_to)
+        if search:
+            filtered_expenses = filtered_expenses.filter(Q(category__icontains=search) | Q(reference__icontains=search) | Q(notes__icontains=search))
+        expenses_total = filtered_expenses.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        delivered_cost = Decimal("0.00")
+        for item in OrderItem.objects.select_related("product").filter(order_id__in=delivered_order_ids):
+            cost_price = item.product.cost_price if item.product and item.product.cost_price is not None else Decimal("0.00")
+            delivered_cost += cost_price * item.quantity
+        gross_profit = filtered_revenue - delivered_cost
         sales_by_day = [
             {
-                "day": (today - timedelta(days=offset)).isoformat(),
-                "sales": delivered.filter(updated_at__date=today - timedelta(days=offset)).aggregate(total=Sum("total"))["total"] or 0,
+                "day": (date_from + timedelta(days=offset)).isoformat(),
+                "sales": Order.objects.filter(
+                    pk__in=delivered_events.filter(
+                        created_at__gte=timezone.make_aware(datetime.combine(date_from + timedelta(days=offset), time.min)),
+                        created_at__lte=timezone.make_aware(datetime.combine(date_from + timedelta(days=offset), time.max)),
+                    ).values_list("order_id", flat=True).distinct()
+                ).aggregate(total=Sum("total"))["total"] or 0,
+                "orders": filtered_orders.filter(
+                    created_at__gte=timezone.make_aware(datetime.combine(date_from + timedelta(days=offset), time.min)),
+                    created_at__lte=timezone.make_aware(datetime.combine(date_from + timedelta(days=offset), time.max)),
+                ).count(),
             }
-            for offset in range(6, -1, -1)
+            for offset in range((date_to - date_from).days + 1)
         ]
-        top_products = Product.objects.order_by("-sales_count").values("id", "name", "sku", "sales_count")[:8]
-        latest_orders = Order.objects.order_by("-created_at").values("id", "order_number", "status", "shipping_full_name", "shipping_city", "total", "created_at")[:8]
+        top_products = (
+            OrderItem.objects.filter(order__in=filtered_orders)
+            .values("product_name", "sku")
+            .annotate(sales_count=Sum("quantity"), revenue=Sum("total"))
+            .order_by("-sales_count", "-revenue")[:8]
+        )
+        latest_orders = filtered_orders.order_by("-created_at").values("id", "order_number", "status", "shipping_full_name", "shipping_city", "total", "created_at")[:8]
+        city_breakdown = (
+            filtered_orders.values("shipping_city")
+            .annotate(order_count=Count("id"), revenue=Sum("total"))
+            .order_by("-order_count", "shipping_city")[:8]
+        )
+        cities = list(Order.objects.exclude(shipping_city="").values_list("shipping_city", flat=True).distinct().order_by("shipping_city"))
         data = {
             **dashboard_metrics(),
             "revenue_total": delivered.aggregate(total=Sum("total"))["total"] or 0,
-            "revenue_today": delivered.filter(updated_at__date=today).aggregate(total=Sum("total"))["total"] or 0,
-            "revenue_month": delivered.filter(updated_at__date__gte=month_start).aggregate(total=Sum("total"))["total"] or 0,
-            "new_orders": Order.objects.filter(status=Order.Status.PENDING).count(),
-            "cancelled_orders": Order.objects.filter(status=Order.Status.CANCELLED).count(),
+            "revenue_today": delivered.filter(updated_at__gte=today_start, updated_at__lte=today_end).aggregate(total=Sum("total"))["total"] or 0,
+            "revenue_month": delivered.filter(updated_at__gte=month_start_dt).aggregate(total=Sum("total"))["total"] or 0,
+            "filtered_revenue": filtered_revenue,
+            "filtered_expenses": expenses_total,
+            "gross_profit": gross_profit,
+            "net_profit": gross_profit - expenses_total,
+            "filtered_orders": total_filtered,
+            "new_orders": filtered_orders.filter(status=Order.Status.PENDING).count(),
+            "confirmed_orders": filtered_orders.filter(status=Order.Status.CONFIRMED).count(),
+            "preparing_orders": filtered_orders.filter(status=Order.Status.PREPARING).count(),
+            "shipped_orders": filtered_orders.filter(status__in=[Order.Status.SHIPPED, Order.Status.OUT_FOR_DELIVERY]).count(),
+            "delivered_orders": delivered_count,
+            "cancelled_orders": cancelled_count,
+            "returned_orders": filtered_orders.filter(status__in=[Order.Status.RETURN_REQUESTED, Order.Status.RETURNED, Order.Status.REFUNDED]).count(),
+            "delivery_rate": round(delivery_rate, 1),
             "products_total": Product.objects.count(),
             "products_active": Product.objects.filter(status=Product.Status.ACTIVE).count(),
             "customers_total": get_user_model().objects.filter(role=User.Role.CUSTOMER).count(),
@@ -1120,9 +1218,174 @@ class DeveloperDashboardView(APIView):
             "sales_by_day": sales_by_day,
             "top_products": list(top_products),
             "latest_orders": list(latest_orders),
+            "city_breakdown": list(city_breakdown),
+            "cities": cities,
+            "status_options": [{"value": value, "label": label} for value, label in Order.Status.choices],
+            "filters": {"date_from": date_from, "date_to": date_to, "city": city, "status": status_filter, "search": search},
             "unread_notifications": CustomerNotification.objects.filter(is_read=False).count(),
         }
         return Response(data)
+
+
+class DeveloperAnalyticsView(APIView):
+    permission_classes = [IsDeveloper]
+
+    def _filters(self, request):
+        today = timezone.localdate()
+        date_from = parse_date(request.query_params.get("date_from") or "") or today - timedelta(days=29)
+        date_to = parse_date(request.query_params.get("date_to") or "") or today
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+        return {
+            "date_from": date_from,
+            "date_to": date_to,
+            "range_start": timezone.make_aware(datetime.combine(date_from, time.min)),
+            "range_end": timezone.make_aware(datetime.combine(date_to, time.max)),
+            "city": str(request.query_params.get("city", "")).strip(),
+            "search": str(request.query_params.get("search", "")).strip(),
+        }
+
+    def _order_filters(self, qs, filters, prefix=""):
+        city_field = f"{prefix}shipping_city"
+        if filters["city"]:
+            qs = qs.filter(**{f"{city_field}__iexact": filters["city"]})
+        if filters["search"]:
+            lookup_prefix = prefix
+            qs = qs.filter(
+                Q(**{f"{lookup_prefix}order_number__icontains": filters["search"]})
+                | Q(**{f"{lookup_prefix}shipping_full_name__icontains": filters["search"]})
+                | Q(**{f"{lookup_prefix}shipping_phone__icontains": filters["search"]})
+                | Q(**{f"{lookup_prefix}guest_email__icontains": filters["search"]})
+                | Q(**{f"{lookup_prefix}tracking_number__icontains": filters["search"]})
+            )
+        return qs
+
+    def _cancel_reason(self, note):
+        marker = "Annulation:"
+        text = str(note or "")
+        if marker not in text:
+            return "Non precisee"
+        reason = text.split(marker, 1)[1].strip().split(".", 1)[0].strip()
+        return reason or "Non precisee"
+
+    def get(self, request):
+        filters = self._filters(request)
+        created_orders = Order.objects.filter(created_at__gte=filters["range_start"], created_at__lte=filters["range_end"])
+        created_orders = self._order_filters(created_orders, filters)
+        expenses = Expense.objects.select_related("supplier", "created_by").filter(date__gte=filters["date_from"], date__lte=filters["date_to"])
+        if filters["search"]:
+            expenses = expenses.filter(Q(category__icontains=filters["search"]) | Q(reference__icontains=filters["search"]) | Q(notes__icontains=filters["search"]) | Q(supplier__name__icontains=filters["search"]))
+        confirmed_events = OrderStatusHistory.objects.select_related("order").filter(created_at__gte=filters["range_start"], created_at__lte=filters["range_end"], to_status=Order.Status.CONFIRMED)
+        delivered_events = OrderStatusHistory.objects.select_related("order").filter(created_at__gte=filters["range_start"], created_at__lte=filters["range_end"], to_status=Order.Status.DELIVERED)
+        cancelled_events = OrderStatusHistory.objects.select_related("order").filter(created_at__gte=filters["range_start"], created_at__lte=filters["range_end"], to_status=Order.Status.CANCELLED)
+        confirmed_events = self._order_filters(confirmed_events, filters, "order__")
+        delivered_events = self._order_filters(delivered_events, filters, "order__")
+        cancelled_events = self._order_filters(cancelled_events, filters, "order__")
+
+        created_count = created_orders.count()
+        confirmed_ids = list(confirmed_events.values_list("order_id", flat=True).distinct())
+        delivered_ids = list(delivered_events.values_list("order_id", flat=True).distinct())
+        cancelled_ids = list(cancelled_events.values_list("order_id", flat=True).distinct())
+        delivered_orders = Order.objects.filter(pk__in=delivered_ids)
+        delivered_revenue = delivered_orders.aggregate(total=Sum("total"))["total"] or Decimal("0.00")
+
+        day_rows = []
+        for offset in range((filters["date_to"] - filters["date_from"]).days + 1):
+            day = filters["date_from"] + timedelta(days=offset)
+            day_start = timezone.make_aware(datetime.combine(day, time.min))
+            day_end = timezone.make_aware(datetime.combine(day, time.max))
+            day_rows.append(
+                {
+                    "day": day.isoformat(),
+                    "created": created_orders.filter(created_at__gte=day_start, created_at__lte=day_end).count(),
+                    "confirmed": confirmed_events.filter(created_at__gte=day_start, created_at__lte=day_end).values("order_id").distinct().count(),
+                    "delivered": delivered_events.filter(created_at__gte=day_start, created_at__lte=day_end).values("order_id").distinct().count(),
+                    "cancelled": cancelled_events.filter(created_at__gte=day_start, created_at__lte=day_end).values("order_id").distinct().count(),
+                }
+            )
+
+        cancellation_reasons = {}
+        for order in Order.objects.filter(pk__in=cancelled_ids):
+            reason = self._cancel_reason(order.internal_note)
+            cancellation_reasons[reason] = cancellation_reasons.get(reason, 0) + 1
+
+        delivery_hours = []
+        for event in delivered_events:
+            if event.order.created_at:
+                delivery_hours.append((event.created_at - event.order.created_at).total_seconds() / 3600)
+        avg_delivery_hours = round(sum(delivery_hours) / len(delivery_hours), 1) if delivery_hours else 0
+
+        margin_rows = []
+        totals = {"revenue": Decimal("0.00"), "cost": Decimal("0.00"), "profit": Decimal("0.00"), "units": 0}
+        for item in OrderItem.objects.select_related("product", "order").filter(order_id__in=delivered_ids):
+            cost_price = item.product.cost_price if item.product and item.product.cost_price is not None else Decimal("0.00")
+            revenue = item.total or Decimal("0.00")
+            cost = cost_price * item.quantity
+            profit = revenue - cost
+            totals["revenue"] += revenue
+            totals["cost"] += cost
+            totals["profit"] += profit
+            totals["units"] += item.quantity
+            margin_rows.append(
+                {
+                    "product_name": item.product_name,
+                    "sku": item.sku,
+                    "quantity": item.quantity,
+                    "revenue": revenue,
+                    "cost": cost,
+                    "profit": profit,
+                    "margin_rate": round((profit / revenue * 100), 1) if revenue else 0,
+                }
+            )
+        grouped = {}
+        for row in margin_rows:
+            group = grouped.setdefault(row["sku"], {**row, "quantity": 0, "revenue": Decimal("0.00"), "cost": Decimal("0.00"), "profit": Decimal("0.00")})
+            group["quantity"] += row["quantity"]
+            group["revenue"] += row["revenue"]
+            group["cost"] += row["cost"]
+            group["profit"] += row["profit"]
+            group["margin_rate"] = round((group["profit"] / group["revenue"] * 100), 1) if group["revenue"] else 0
+        expenses_total = expenses.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        expenses_by_category = list(expenses.values("category").annotate(amount=Sum("amount"), count=Count("id")).order_by("-amount", "category"))
+        latest_expenses = list(expenses.order_by("-date", "-created_at").values("id", "category", "amount", "date", "reference", "notes")[:10])
+        net_profit = totals["profit"] - expenses_total
+
+        return Response(
+            {
+                "filters": {"date_from": filters["date_from"], "date_to": filters["date_to"], "city": filters["city"], "search": filters["search"]},
+                "cities": list(Order.objects.exclude(shipping_city="").values_list("shipping_city", flat=True).distinct().order_by("shipping_city")),
+                "orders": {
+                    "created": created_count,
+                    "confirmed": len(confirmed_ids),
+                    "delivered": len(delivered_ids),
+                    "cancelled": len(cancelled_ids),
+                    "confirmation_rate": round((len(confirmed_ids) / created_count * 100), 1) if created_count else 0,
+                    "delivery_rate": round((len(delivered_ids) / max(created_count - len(cancelled_ids), len(delivered_ids)) * 100), 1) if (created_count or delivered_ids) else 0,
+                    "cancel_rate": round((len(cancelled_ids) / created_count * 100), 1) if created_count else 0,
+                    "avg_delivery_hours": avg_delivery_hours,
+                    "delivered_revenue": delivered_revenue,
+                },
+                "daily": day_rows,
+                "cancellation_reasons": [{"reason": reason, "count": count} for reason, count in sorted(cancellation_reasons.items(), key=lambda item: item[1], reverse=True)],
+                "city_breakdown": list(created_orders.values("shipping_city").annotate(order_count=Count("id"), revenue=Sum("total")).order_by("-order_count")[:10]),
+                "margins": {
+                    "revenue": totals["revenue"],
+                    "cost": totals["cost"],
+                    "gross_profit": totals["profit"],
+                    "profit": net_profit,
+                    "expenses": expenses_total,
+                    "units": totals["units"],
+                    "margin_rate": round((net_profit / totals["revenue"] * 100), 1) if totals["revenue"] else 0,
+                    "products": sorted(grouped.values(), key=lambda row: row["profit"], reverse=True)[:20],
+                },
+                "expenses": {
+                    "total": expenses_total,
+                    "count": expenses.count(),
+                    "by_category": expenses_by_category,
+                    "latest": latest_expenses,
+                },
+            }
+        )
 
 
 class DeveloperSystemView(APIView):

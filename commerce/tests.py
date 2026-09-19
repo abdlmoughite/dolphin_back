@@ -12,7 +12,7 @@ from PIL import Image
 from rest_framework.test import APIClient
 
 from .importers.validators import TEMPLATE_COLUMNS
-from .models import AuditLog, Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Expense, Inventory, NewsletterSubscriber, Order, OrderItem, Product, ProductImportJob, ProductImage, ProductReview, ProductVariant, Refund, ReturnItem, ReturnRequest, StockMovement, Supplier, SupportTicket
+from .models import AuditLog, Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Expense, Inventory, NewsletterSubscriber, Order, OrderItem, Product, ProductImportJob, ProductImage, ProductVariant, Refund, ReturnItem, ReturnRequest, StockMovement, Supplier, SupportTicket
 
 
 class CommerceApiTests(TestCase):
@@ -54,6 +54,7 @@ class CommerceApiTests(TestCase):
         response = self.client.post("/api/v1/auth/login/", {"email": "admin@test.local", "password": "Password123!"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("access", response.data)
+        self.assertEqual(response.data["user"]["page_permissions"], get_user_model().ADMIN_PAGE_PERMISSIONS)
 
     def test_customer_cannot_create_category(self):
         self.login(self.customer)
@@ -746,13 +747,57 @@ class CommerceApiTests(TestCase):
         )
 
         self.login(self.admin)
-        self.assertEqual(self.client.get("/api/v1/admin/staff/").status_code, 200)
+        staff_list = self.client.get("/api/v1/admin/staff/")
+        self.assertEqual(staff_list.status_code, 200)
+        self.assertNotIn("client@test.local", [row["email"] for row in staff_list.data["results"]])
         self.assertEqual(self.client.post("/api/v1/developer/suppliers/", {"name": "Supplier Matrix"}, format="json").status_code, 201)
+        customer_staff_response = self.client.post(
+            "/api/v1/admin/staff/",
+            {
+                "email": "not-staff@test.local",
+                "username": "not-staff@test.local",
+                "password": "Password123!",
+                "role": User.Role.CUSTOMER,
+                "status": User.Status.ACTIVE,
+            },
+            format="json",
+        )
+        self.assertEqual(customer_staff_response.status_code, 400)
 
         self.login(manager)
         self.assertEqual(self.client.post("/api/v1/products/", {"name": "Manager Product", "sku": "MGR-001", "category_id": self.category.id, "regular_price": "10.00"}, format="json").status_code, 201)
-        self.assertEqual(self.client.get("/api/v1/admin/staff/").status_code, 403)
+        self.assertEqual(self.client.get("/api/v1/admin/staff/").status_code, 200)
+        staff_response = self.client.post(
+            "/api/v1/admin/staff/",
+            {
+                "email": "staff-created@test.local",
+                "username": "staff-created@test.local",
+                "password": "Password123!",
+                "role": User.Role.ORDER_OPERATOR,
+                "status": User.Status.ACTIVE,
+                "page_permissions": ["dashboard", "orders"],
+            },
+            format="json",
+        )
+        self.assertEqual(staff_response.status_code, 201)
+        self.assertEqual(staff_response.data["page_permissions"], ["dashboard", "orders"])
         self.assertEqual(self.client.get("/api/v1/developer/suppliers/").status_code, 403)
+
+        self.login(self.admin)
+        super_staff_response = self.client.post(
+            "/api/v1/admin/staff/",
+            {
+                "email": "super-created@test.local",
+                "username": "super-created@test.local",
+                "password": "Password123!",
+                "role": User.Role.SUPER_ADMIN,
+                "status": User.Status.ACTIVE,
+                "page_permissions": [],
+            },
+            format="json",
+        )
+        self.assertEqual(super_staff_response.status_code, 201, super_staff_response.data)
+        self.assertEqual(super_staff_response.data["page_permissions"], User.ADMIN_PAGE_PERMISSIONS)
 
         self.login(operator)
         self.assertEqual(self.client.post(f"/api/v1/orders/{order.id}/transition/", {"status": "CONFIRMED"}, format="json").status_code, 200)
@@ -762,7 +807,6 @@ class CommerceApiTests(TestCase):
         self.login(support)
         self.assertEqual(self.client.get("/api/v1/support/").status_code, 200)
         self.assertEqual(self.client.get("/api/v1/returns/").status_code, 200)
-        self.assertEqual(self.client.get("/api/v1/reviews/").status_code, 200)
         self.assertEqual(self.client.post(f"/api/v1/orders/{order.id}/transition/", {"status": "PREPARING"}, format="json").status_code, 403)
         self.assertEqual(self.client.post("/api/v1/products/", {"name": "Support Product", "sku": "SUP-001", "category_id": self.category.id, "regular_price": "10.00"}, format="json").status_code, 403)
 
@@ -891,21 +935,6 @@ class CommerceApiTests(TestCase):
         self.login(support)
         self.assertEqual(self.client.get("/api/v1/support/").data["count"], 1)
         self.assertEqual(SupportTicket.objects.count(), 1)
-
-    def test_review_visibility_differs_between_customer_and_support(self):
-        pending = ProductReview.objects.create(product=self.product, user=self.customer, rating=4, comment="En attente")
-        other = get_user_model().objects.create_user(email="review-other@test.local", username="review-other", password="Password123!", role=get_user_model().Role.CUSTOMER)
-        self.login(other)
-        customer_response = self.client.get("/api/v1/reviews/")
-        self.assertEqual(customer_response.status_code, 200)
-        self.assertEqual(customer_response.data["count"], 0)
-
-        support = get_user_model().objects.create_user(email="review-support@test.local", username="review-support", password="Password123!", role=get_user_model().Role.CUSTOMER_SUPPORT, is_staff=True)
-        self.login(support)
-        support_response = self.client.get("/api/v1/reviews/")
-        self.assertEqual(support_response.status_code, 200)
-        self.assertEqual(support_response.data["count"], 1)
-        self.assertEqual(support_response.data["results"][0]["id"], pending.id)
 
     def test_expenses_suppliers_and_excel_exports_are_protected(self):
         response = self.client.get("/api/v1/developer/expenses/")

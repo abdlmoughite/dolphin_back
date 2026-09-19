@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser
-from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
+from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import timezone
 from django.utils.text import slugify
@@ -18,6 +18,29 @@ class TimeStampedModel(models.Model):
 
 
 class User(AbstractUser):
+    ADMIN_PAGE_PERMISSIONS = [
+        "dashboard",
+        "products",
+        "categories",
+        "brands",
+        "imports",
+        "orders",
+        "customers",
+        "staff",
+        "promotions",
+        "coupons",
+        "delivery-zones",
+        "banners",
+        "home-sections",
+        "support",
+        "returns",
+        "suppliers",
+        "expenses",
+        "settings",
+        "reports",
+        "audit-logs",
+    ]
+
     class Role(models.TextChoices):
         SUPER_ADMIN = "SUPER_ADMIN", "Super Admin"
         MANAGER = "MANAGER", "Manager"
@@ -41,12 +64,26 @@ class User(AbstractUser):
     )
     email_verified_at = models.DateTimeField(blank=True, null=True)
     token_version = models.PositiveIntegerField(default=0)
+    page_permissions = models.JSONField(default=list, blank=True)
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = ["username"]
 
     @property
     def is_staff_member(self):
         return self.role != self.Role.CUSTOMER
+
+    @property
+    def effective_page_permissions(self):
+        if self.role == self.Role.SUPER_ADMIN:
+            return self.ADMIN_PAGE_PERMISSIONS
+        return self.page_permissions or []
+
+    def save(self, *args, **kwargs):
+        if self.role == self.Role.SUPER_ADMIN:
+            self.page_permissions = self.ADMIN_PAGE_PERMISSIONS
+            self.is_staff = True
+            self.is_superuser = True
+        super().save(*args, **kwargs)
 
 
 class CustomerProfile(TimeStampedModel):
@@ -250,29 +287,6 @@ class RecentlyViewedProduct(TimeStampedModel):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="recently_viewed", null=True, blank=True)
     session_key = models.CharField(max_length=80, blank=True, db_index=True)
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
-
-
-class ProductReview(TimeStampedModel):
-    class Status(models.TextChoices):
-        PENDING = "PENDING", "En attente"
-        APPROVED = "APPROVED", "Approuve"
-        REJECTED = "REJECTED", "Rejete"
-
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="reviews")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    order_item = models.OneToOneField("OrderItem", on_delete=models.SET_NULL, null=True, blank=True)
-    rating = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
-    comment = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
-    verified_purchase = models.BooleanField(default=False)
-
-    class Meta:
-        unique_together = ("product", "user", "order_item")
-
-
-class ReviewImage(TimeStampedModel):
-    review = models.ForeignKey(ProductReview, on_delete=models.CASCADE, related_name="images")
-    image = models.ImageField(upload_to="reviews/")
 
 
 class Promotion(TimeStampedModel):
@@ -511,6 +525,21 @@ class HomepageBanner(TimeStampedModel):
     starts_at = models.DateTimeField(blank=True, null=True)
     ends_at = models.DateTimeField(blank=True, null=True)
     is_active = models.BooleanField(default=True)
+
+
+class HomeSection(TimeStampedModel):
+    key = models.SlugField(max_length=80, unique=True)
+    title = models.CharField(max_length=140)
+    description = models.CharField(max_length=260, blank=True)
+    is_visible = models.BooleanField(default=True, db_index=True)
+    display_order = models.PositiveIntegerField(default=0)
+    products = models.ManyToManyField(Product, blank=True, related_name="home_sections")
+
+    class Meta:
+        ordering = ["display_order", "title"]
+
+    def __str__(self):
+        return self.title
 
 
 class NewsletterSubscriber(TimeStampedModel):

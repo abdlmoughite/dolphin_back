@@ -41,7 +41,7 @@ class IsAdminOrDeveloper(BasePermission):
         return bool(request.user and request.user.is_authenticated and request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER})
 
 
-class CanManageUsers(IsDeveloper):
+class CanManageUsers(IsAdminOrDeveloper):
     pass
 
 

@@ -35,7 +35,6 @@ from commerce.models import (
     Product,
     ProductAttribute,
     ProductImage,
-    ProductReview,
     ProductVariant,
     Promotion,
     StockMovement,
@@ -177,8 +176,6 @@ class Command(BaseCommand):
             | Order.objects.filter(user__email__endswith=f"@{DEMO_DOMAIN}")
             | Order.objects.filter(items__product__in=demo_products)
         ).distinct()
-        ProductReview.objects.filter(user__email__endswith=f"@{DEMO_DOMAIN}").delete()
-        ProductReview.objects.filter(order_item__order__in=demo_orders).delete()
         WishlistItem.objects.filter(wishlist__user__email__endswith=f"@{DEMO_DOMAIN}").delete()
         Wishlist.objects.filter(user__email__endswith=f"@{DEMO_DOMAIN}").delete()
         CustomerNotification.objects.filter(user__email__endswith=f"@{DEMO_DOMAIN}").delete()
@@ -490,30 +487,10 @@ class Command(BaseCommand):
         return customers
 
     def seed_customer_content(self, customers, products):
-        comments = [
-            "Produit conforme, livraison rapide et emballage soigne.",
-            "Tres bon rapport qualite prix pour une utilisation quotidienne.",
-            "La fiche produit est claire et le produit fonctionne comme prevu.",
-            "Commande recue en bon etat, je recommande cette selection.",
-            "Service pratique, prix correct et suivi simple.",
-        ]
         for index, user in enumerate(customers):
             wishlist, _ = Wishlist.objects.get_or_create(user=user)
             WishlistItem.objects.update_or_create(wishlist=wishlist, product=products[index % len(products)])
             WishlistItem.objects.update_or_create(wishlist=wishlist, product=products[(index + 7) % len(products)])
-            for offset in range(2):
-                product = products[(index * 3 + offset) % len(products)]
-                ProductReview.objects.update_or_create(
-                    product=product,
-                    user=user,
-                    order_item=None,
-                    defaults={
-                        "rating": 3 + ((index + offset) % 3),
-                        "comment": comments[(index + offset) % len(comments)],
-                        "status": ProductReview.Status.APPROVED,
-                        "verified_purchase": offset == 0,
-                    },
-                )
             CustomerNotification.objects.update_or_create(
                 user=user,
                 title="Bienvenue chez DOLPHIN",

@@ -18,6 +18,7 @@ from .models import (
     DeliveryZone,
     Expense,
     HomepageBanner,
+    HomeSection,
     Inventory,
     Order,
     OrderItem,
@@ -27,7 +28,6 @@ from .models import (
     ProductImage,
     ProductImportJob,
     ProductImportRow,
-    ProductReview,
     ProductVariant,
     Promotion,
     NewsletterSubscriber,
@@ -61,15 +61,21 @@ class DolphinTokenObtainPairSerializer(TokenObtainPairSerializer):
 
 
 class UserSerializer(serializers.ModelSerializer):
+    page_permissions = serializers.SerializerMethodField()
+
     class Meta:
         model = get_user_model()
-        fields = ["id", "email", "username", "first_name", "last_name", "phone", "avatar", "role", "status"]
+        fields = ["id", "email", "username", "first_name", "last_name", "phone", "avatar", "role", "status", "page_permissions"]
         read_only_fields = ["role", "status"]
+
+    def get_page_permissions(self, obj):
+        return obj.effective_page_permissions
 
 
 class DeveloperUserSerializer(serializers.ModelSerializer):
     order_count = serializers.IntegerField(read_only=True, default=0)
     total_spent = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, default=0)
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True, validators=[validate_password])
 
     class Meta:
         model = get_user_model()
@@ -88,30 +94,63 @@ class DeveloperUserSerializer(serializers.ModelSerializer):
             "last_login",
             "order_count",
             "total_spent",
+            "page_permissions",
+            "password",
         ]
         read_only_fields = ["is_superuser", "date_joined", "last_login", "order_count", "total_spent"]
 
     def validate_role(self, value):
         request = self.context.get("request")
+        if value == User.Role.CUSTOMER:
+            raise serializers.ValidationError("Les comptes staff ne peuvent pas etre des clients.")
         if value == User.Role.SUPER_ADMIN and not (request and request.user.role == User.Role.SUPER_ADMIN):
             raise serializers.ValidationError("Seul un Developer peut attribuer ce role.")
         return value
 
+    def validate_page_permissions(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Les permissions doivent etre une liste.")
+        allowed = set(User.ADMIN_PAGE_PERMISSIONS)
+        invalid = [item for item in value if item not in allowed]
+        if invalid:
+            raise serializers.ValidationError(f"Permissions inconnues: {', '.join(invalid)}")
+        return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["page_permissions"] = instance.effective_page_permissions
+        return data
+
     def update(self, instance, validated_data):
+        password = validated_data.pop("password", "")
         request = self.context.get("request")
         actor = getattr(request, "user", None)
         if actor and actor.pk == instance.pk:
-            sensitive = {"role", "status", "is_staff"} & set(validated_data)
+            sensitive = {"role", "status", "is_staff", "page_permissions"} & set(validated_data)
             if sensitive:
                 raise serializers.ValidationError("Vous ne pouvez pas modifier vos propres permissions.")
         for field, value in validated_data.items():
             setattr(instance, field, value)
-        instance.is_staff = instance.role != User.Role.CUSTOMER
+        instance.is_staff = True
         if instance.role == User.Role.SUPER_ADMIN:
             instance.is_superuser = True
             instance.is_staff = True
+            instance.page_permissions = User.ADMIN_PAGE_PERMISSIONS
+        if password:
+            instance.set_password(password)
         instance.save()
         return instance
+
+    def create(self, validated_data):
+        password = validated_data.pop("password", "")
+        role = validated_data.get("role", User.Role.MANAGER)
+        validated_data["is_staff"] = True
+        if role == User.Role.SUPER_ADMIN:
+            validated_data["is_superuser"] = True
+            validated_data["is_staff"] = True
+            validated_data["page_permissions"] = User.ADMIN_PAGE_PERMISSIONS
+        user = get_user_model().objects.create_user(password=password or None, **validated_data)
+        return user
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -223,8 +262,6 @@ class ProductSerializer(serializers.ModelSerializer):
     variants = serializers.SerializerMethodField()
     current_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     discount_percent = serializers.IntegerField(read_only=True)
-    average_rating = serializers.FloatField(read_only=True, default=0)
-
     class Meta:
         model = Product
         fields = "__all__"
@@ -508,15 +545,6 @@ class OrderSerializer(serializers.ModelSerializer):
         read_only_fields = ["order_number", "user", "subtotal", "discount_total", "shipping_total", "tax_total", "total"]
 
 
-class ProductReviewSerializer(serializers.ModelSerializer):
-    user_name = serializers.CharField(source="user.first_name", read_only=True)
-
-    class Meta:
-        model = ProductReview
-        fields = ["id", "product", "rating", "comment", "status", "verified_purchase", "user_name", "created_at"]
-        read_only_fields = ["status", "verified_purchase"]
-
-
 class WishlistItemSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)
     product_id = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all(), source="product", write_only=True)
@@ -634,6 +662,23 @@ class HomepageBannerSerializer(serializers.ModelSerializer):
     class Meta:
         model = HomepageBanner
         fields = "__all__"
+
+
+class HomeSectionSerializer(serializers.ModelSerializer):
+    products = serializers.SerializerMethodField()
+    product_ids = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all(), many=True, source="products", write_only=True, required=False)
+
+    class Meta:
+        model = HomeSection
+        fields = ["id", "key", "title", "description", "is_visible", "display_order", "products", "product_ids", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def get_products(self, obj):
+        products = obj.products.all()
+        request = self.context.get("request")
+        if not (request and request.user.is_authenticated and request.user.role in {User.Role.SUPER_ADMIN, User.Role.MANAGER}):
+            products = products.filter(status=Product.Status.ACTIVE, category__is_active=True, category__is_archived=False)
+        return ProductSerializer(products, many=True, context=self.context).data
 
 
 class NewsletterSubscriberSerializer(serializers.ModelSerializer):
