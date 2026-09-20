@@ -1385,9 +1385,20 @@ class ReturnRequestViewSet(viewsets.ModelViewSet):
 
 
 class HomepageBannerViewSet(viewsets.ModelViewSet):
-    queryset = HomepageBanner.objects.filter(is_active=True).order_by("-created_at")
     serializer_class = HomepageBannerSerializer
-    permission_classes = [IsCatalogManagerOrReadOnly]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        qs = HomepageBanner.objects.order_by("-created_at")
+        user = self.request.user
+        if not (user.is_authenticated and user.role == User.Role.SUPER_ADMIN):
+            qs = qs.filter(is_active=True)
+        return qs
+
+    def get_permissions(self):
+        if self.request.method in {"GET", "HEAD", "OPTIONS"}:
+            return [AllowAny()]
+        return [IsDeveloper()]
 
 
 class HomeSectionViewSet(viewsets.ModelViewSet):
