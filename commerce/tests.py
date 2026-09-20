@@ -1,6 +1,7 @@
+import csv
 from datetime import timedelta
 from decimal import Decimal
-from io import BytesIO
+from io import BytesIO, StringIO
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -12,7 +13,8 @@ from PIL import Image
 from rest_framework.test import APIClient
 
 from .importers.validators import TEMPLATE_COLUMNS
-from .models import AuditLog, Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Expense, Inventory, NewsletterSubscriber, Order, OrderItem, Product, ProductImportJob, ProductImage, ProductVariant, Refund, ReturnItem, ReturnRequest, StockMovement, Supplier, SupportTicket
+from .models import AttributeValue, AuditLog, Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Expense, Inventory, NewsletterSubscriber, Order, OrderItem, Product, ProductImportJob, ProductImage, ProductVariant, Refund, ReturnItem, ReturnRequest, StockMovement, Supplier, SupportTicket
+from .views import find_ozon_tracking_number, order_status_from_ozon, normalize_ozon_cities
 
 
 class CommerceApiTests(TestCase):
@@ -46,6 +48,34 @@ class CommerceApiTests(TestCase):
     def login(self, user):
         self.client.force_authenticate(user=user)
 
+    def csv_upload(self, filename, rows):
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=TEMPLATE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+        return SimpleUploadedFile(filename, output.getvalue().encode("utf-8"), content_type="text/csv")
+
+    def test_ozon_cities_payload_is_split_from_cities_object(self):
+        payload = {
+            "CITIES": {
+                "37": {"ID": 37, "REF": "AGA", "NAME": "Agadir"},
+                "49": {"ID": 49, "REF": "AIL", "NAME": "Ait Melloul"},
+            }
+        }
+        self.assertEqual(
+            normalize_ozon_cities(payload),
+            [{"id": "37", "name": "Agadir"}, {"id": "49", "name": "Ait Melloul"}],
+        )
+
+    def test_ozon_tracking_number_is_found_in_nested_response(self):
+        payload = {"ADD-PARCEL": {"RESULT": "SUCCESS", "NEW-PARCEL": {"TRACKING-NUMBER": "OZE123456789"}}}
+        self.assertEqual(find_ozon_tracking_number(payload), "OZE123456789")
+
+    def test_ozon_status_maps_to_order_status(self):
+        self.assertEqual(order_status_from_ozon("Delivered"), Order.Status.DELIVERED)
+        self.assertEqual(order_status_from_ozon("En livraison"), Order.Status.OUT_FOR_DELIVERY)
+        self.assertEqual(order_status_from_ozon("Returned"), Order.Status.RETURNED)
+
     def test_customer_registration_and_admin_login_work(self):
         response = self.client.post("/api/v1/auth/register/", {"email": "new@test.local", "username": "new", "password": "Password123!", "first_name": "New", "last_name": "Client"})
         self.assertEqual(response.status_code, 201, response.data)
@@ -55,6 +85,26 @@ class CommerceApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("access", response.data)
         self.assertEqual(response.data["user"]["page_permissions"], get_user_model().ADMIN_PAGE_PERMISSIONS)
+
+    def test_customer_registration_accepts_arabic_names_and_emoji(self):
+        first_name = "\u0633\u0627\u0631\u0629"
+        last_name = "\u0628\u0646\u0627\u0646\u064a \U0001f60a"
+        response = self.client.post(
+            "/api/v1/auth/register/",
+            {
+                "email": "arabic@test.local",
+                "username": "arabic",
+                "password": "Password123!",
+                "first_name": first_name,
+                "last_name": last_name,
+                "phone": "+212612345679",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        user = get_user_model().objects.get(email="arabic@test.local")
+        self.assertEqual(user.first_name, first_name)
+        self.assertEqual(user.last_name, last_name)
 
     def test_customer_cannot_create_category(self):
         self.login(self.customer)
@@ -159,6 +209,27 @@ class CommerceApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         response = self.client.post(f"/api/v1/products/{product.slug}/duplicate/")
         self.assertEqual(response.status_code, 201)
+
+    def test_admin_product_accepts_arabic_french_and_emoji_text(self):
+        self.login(self.admin)
+        color = "\u0623\u0633\u0648\u062f / Noir \U0001f5a4"
+        payload = {
+            "name": "\u0647\u0627\u062a\u0641 \u0630\u0643\u064a Dolphin Pro \U0001f60a",
+            "sku": "AR-EMOJI-001",
+            "category_id": self.category.id,
+            "brand_id": self.brand.id,
+            "short_description": "Qualite \u0645\u0645\u062a\u0627\u0632\u0629 \u0648 livraison rapide \u2728",
+            "description": "Produit mixte: \u0634\u0627\u0634\u0629 \u0642\u0648\u064a\u0629\u060c batterie durable, \u0648 cadeau \U0001f381.",
+            "regular_price": "499.00",
+            "status": "ACTIVE",
+            "variants_payload": [{"sku": "AR-EMOJI-001-NOIR", "color": color}],
+        }
+        response = self.client.post("/api/v1/products/", payload, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        product = Product.objects.get(sku="AR-EMOJI-001")
+        self.assertEqual(product.name, payload["name"])
+        self.assertEqual(product.description, payload["description"])
+        self.assertTrue(AttributeValue.objects.filter(value=color).exists())
 
     def test_admin_can_manage_promotions(self):
         self.login(self.admin)
@@ -267,6 +338,38 @@ class CommerceApiTests(TestCase):
         self.assertTrue(Product.objects.filter(sku="IMP-001").exists())
         self.assertFalse(Product.objects.filter(sku="IMP-BAD").exists())
         self.assertEqual(response.data["failed_count"], 1)
+
+    def test_csv_import_keeps_arabic_french_and_emoji_text(self):
+        self.login(self.admin)
+        row = dict.fromkeys(TEMPLATE_COLUMNS, "")
+        row.update(
+            {
+                "name": "\u0633\u0645\u0627\u0639\u0627\u062a Dolphin \U0001f3a7",
+                "sku": "IMP-AR-001",
+                "category": "\u0627\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0643",
+                "brand": "\u0645\u0627\u0631\u0643\u0629 Dolphin",
+                "short_description": "Son clair \u0648 battery \u0645\u0632\u064a\u0627\u0646\u0629 \U0001f50b",
+                "description": "Description \u0641\u064a\u0647\u0627 \u0639\u0631\u0628\u064a\u060c francais et emoji \U0001f60a",
+                "regular_price": "199.00",
+                "stock": "8",
+                "color": "\u0623\u0628\u064a\u0636 / Blanc \U0001f90d",
+                "is_active": "false",
+            }
+        )
+        upload = self.csv_upload("arabic-products.csv", [row])
+        preview = self.client.post("/api/v1/admin/product-imports/preview/", {"file": upload}, format="multipart")
+        self.assertEqual(preview.status_code, 201, preview.data)
+        normalized = preview.data["rows"][0]["normalized_data"]
+        self.assertEqual(normalized["name"], row["name"])
+        self.assertEqual(normalized["description"], row["description"])
+
+        committed = self.client.post(f"/api/v1/admin/product-imports/{preview.data['id']}/commit/", {"create_missing_relations": True}, format="json")
+        self.assertEqual(committed.status_code, 200, committed.data)
+        product = Product.objects.get(sku="IMP-AR-001")
+        self.assertEqual(product.name, row["name"])
+        self.assertEqual(product.category.name, row["category"])
+        self.assertEqual(product.description, row["description"])
+        self.assertTrue(AttributeValue.objects.filter(value=row["color"]).exists())
 
     def test_csv_import_duplicate_sku_skip_and_update(self):
         self.login(self.admin)

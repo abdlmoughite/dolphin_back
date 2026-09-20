@@ -1,11 +1,13 @@
 import csv
+import json
 import platform
 import sys
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, time, timedelta
 from io import BytesIO
 
 import django
+import requests
 from openpyxl import Workbook
 from PIL import Image
 from django.conf import settings
@@ -53,6 +55,7 @@ from .models import (
     Refund,
     ReturnHistory,
     ReturnRequest,
+    SiteSettings,
     StockMovement,
     Supplier,
     SupportTicket,
@@ -105,6 +108,39 @@ def request_bool(value, default=False):
     return str(value).lower() in {"1", "true", "yes", "oui"}
 
 
+HOME_DESIGN_DEFAULTS = {
+    "store_name": "DOLPHIN",
+    "announcement_text": "Livraison gratuite partout au Maroc",
+    "announcement_bg_color": "#FF6B4A",
+    "announcement_text_color": "#FFFFFF",
+    "hero_eyebrow": "Marketplace multi-categories au Maroc",
+    "hero_title": "DOLPHIN",
+    "hero_subtitle": "Tout ce qu'il vous faut, au meme endroit. Produits selectionnes, promotions claires, livraison gratuite.",
+    "primary_cta_label": "Decouvrir les produits",
+    "primary_cta_url": "/catalogue",
+    "secondary_cta_label": "Voir les offres",
+    "secondary_cta_url": "/catalogue?promotion=true",
+    "trust_1": "Variantes disponibles",
+    "trust_2": "Paiement livraison",
+    "trust_3": "Retours suivis",
+    "service_1_title": "Livraison gratuite",
+    "service_1_text": "Livraison gratuite partout au Maroc avec suivi de commande.",
+    "service_2_title": "Paiement securise",
+    "service_2_text": "Paiement a la livraison sur les zones actives.",
+    "service_3_title": "Support verifie",
+    "service_3_text": "Service client disponible pour commandes, livraison et retours.",
+    "newsletter_title": "Newsletter",
+    "newsletter_subtitle": "Recevez les nouveautes et promotions publiees par Dolphin.",
+    "primary_color": "#0077B6",
+    "accent_color": "#FF6B4A",
+}
+
+
+def home_design_settings():
+    settings_row, _ = SiteSettings.objects.get_or_create(key="home_design", defaults={"value": HOME_DESIGN_DEFAULTS})
+    return settings_row, {**HOME_DESIGN_DEFAULTS, **(settings_row.value or {})}
+
+
 def client_ip(request):
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
     if forwarded:
@@ -152,6 +188,11 @@ def money_dh(value):
     if amount == amount.to_integral():
         return f"{amount:.0f} Dh"
     return f"{amount:.2f} Dh"
+
+
+def ozon_amount(value):
+    amount = Decimal(value or "0.00")
+    return str(int(amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
 
 
 def invoice_number(order):
@@ -774,6 +815,330 @@ class CheckoutView(APIView):
         return Response(OrderSerializer(order).data, status=201)
 
 
+def ozon_settings():
+    settings_row, _ = SiteSettings.objects.get_or_create(key="ozon", defaults={"value": {}})
+    return settings_row
+
+
+def ozon_settings_payload(value):
+    return {
+        "customer_id": value.get("customer_id", ""),
+        "api_key": value.get("api_key", ""),
+        "has_api_key": bool(value.get("api_key")),
+    }
+
+
+def ozon_order_products(order):
+    return [
+        {"ref": item.sku or f"ORDER-{order.id}-{item.id}", "qnty": item.quantity}
+        for item in order.items.all()
+    ]
+
+
+def normalize_ozon_cities(payload):
+    if isinstance(payload, dict):
+        rows = payload.get("CITIES") or payload.get("cities") or payload.get("data") or payload.get("results") or payload.get("CITY") or payload.get("VILLES")
+        if rows is None:
+            rows = [{"id": key, "name": value} for key, value in payload.items()]
+    else:
+        rows = payload
+    if isinstance(rows, dict):
+        rows = [
+            value if isinstance(value, dict) else {"id": key, "name": value}
+            for key, value in rows.items()
+        ]
+    cities = []
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, str):
+            cities.append({"id": row, "name": row})
+            continue
+        if not isinstance(row, dict):
+            continue
+        city_id = row.get("id") or row.get("ID") or row.get("city_id") or row.get("CITY_ID") or row.get("ref")
+        name = row.get("name") or row.get("NAME") or row.get("city") or row.get("CITY") or row.get("ville") or row.get("VILLE")
+        if city_id and name:
+            cities.append({"id": str(city_id), "name": str(name)})
+    return sorted(cities, key=lambda city: city["name"].lower())
+
+
+def find_ozon_tracking_number(payload):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = str(key).replace("-", "").replace("_", "").upper()
+            if normalized_key in {"TRACKINGNUMBER", "TRACKING"} and value:
+                return str(value)
+            found = find_ozon_tracking_number(value)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = find_ozon_tracking_number(item)
+            if found:
+                return found
+    return ""
+
+
+def normalize_ozon_key(value):
+    return str(value).replace("-", "").replace("_", "").replace(" ", "").upper()
+
+
+def ozon_status_from_payload(payload):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = normalize_ozon_key(key)
+            if normalized_key in {"STATUS", "STATUT", "PARCELSTATUS", "DELIVERYSTATUS", "LASTSTATUS", "MESSAGE"} and value:
+                text = str(value)
+                if text.upper() not in {"SUCCESS", "VALID CUSTOMER"}:
+                    return text
+        for value in payload.values():
+            found = ozon_status_from_payload(value)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = ozon_status_from_payload(item)
+            if found:
+                return found
+    return ""
+
+
+def collect_ozon_tracking_rows(payload):
+    rows = {}
+    if isinstance(payload, dict):
+        tracking = find_ozon_tracking_number(payload)
+        if tracking:
+            rows[tracking] = payload
+        for key, value in payload.items():
+            if isinstance(value, dict) and key:
+                nested_tracking = find_ozon_tracking_number(value) or str(key)
+                if nested_tracking and isinstance(value, dict):
+                    rows[nested_tracking] = value
+            rows.update(collect_ozon_tracking_rows(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            rows.update(collect_ozon_tracking_rows(item))
+    return rows
+
+
+def order_status_from_ozon(ozon_status):
+    status = normalize_ozon_key(ozon_status)
+    if not status:
+        return ""
+    if any(word in status for word in ["DELIVERED", "LIVRE", "LIVREE"]):
+        return Order.Status.DELIVERED
+    if any(word in status for word in ["RETURN", "RETOUR"]):
+        return Order.Status.RETURNED
+    if any(word in status for word in ["REFUSE", "REFUSED", "CANCEL", "ANNULE"]):
+        return Order.Status.CANCELLED
+    if any(word in status for word in ["DISTRIBUTION", "DELIVERY", "LIVRAISON", "COURSIER"]):
+        return Order.Status.OUT_FOR_DELIVERY
+    if any(word in status for word in ["PICKED", "PICKUP", "RAMASSE", "RECEIVED", "RECU", "EXPEDIE", "SHIPPED", "TRANSIT"]):
+        return Order.Status.SHIPPED
+    return ""
+
+
+class OzonSettingsView(APIView):
+    permission_classes = [IsAdminRole]
+
+    def get(self, request):
+        settings_row = ozon_settings()
+        return Response(ozon_settings_payload(settings_row.value or {}))
+
+    def patch(self, request):
+        customer_id = str(request.data.get("customer_id", "")).strip()
+        api_key = str(request.data.get("api_key", "")).strip()
+        if not customer_id or not api_key:
+            return Response({"detail": "Ozon customer ID et API key sont obligatoires."}, status=400)
+        settings_row = ozon_settings()
+        before = settings_row.value or {}
+        settings_row.value = {"customer_id": customer_id, "api_key": api_key}
+        settings_row.save(update_fields=["value", "updated_at"])
+        AuditLog.objects.create(
+            actor=request.user,
+            action="OZON_SETTINGS_UPDATED",
+            entity="SiteSettings",
+            entity_id=str(settings_row.pk),
+            before={"customer_id": before.get("customer_id", ""), "has_api_key": bool(before.get("api_key"))},
+            after={"customer_id": customer_id, "has_api_key": True},
+            ip_address=client_ip(request),
+        )
+        return Response(ozon_settings_payload(settings_row.value))
+
+
+class OzonCitiesView(APIView):
+    permission_classes = [IsOrderManager]
+
+    def get(self, request):
+        try:
+            response = requests.get("https://api.ozonexpress.ma/cities", timeout=20)
+            response.raise_for_status()
+            cities = normalize_ozon_cities(response.json())
+        except requests.RequestException as exc:
+            return Response({"detail": f"Ozon cities indisponible: {exc}"}, status=502)
+        except ValueError:
+            return Response({"detail": "Reponse villes Ozon invalide."}, status=502)
+        return Response(cities)
+
+
+class OzonEligibleOrdersView(APIView):
+    permission_classes = [IsOrderManager]
+
+    def get(self, request):
+        qs = (
+            Order.objects.select_related("user", "delivery_zone")
+            .prefetch_related("items")
+            .filter(tracking_number="")
+            .filter(status=Order.Status.CONFIRMED)
+            .order_by("-created_at")[:100]
+        )
+        return Response(OrderSerializer(qs, many=True).data)
+
+
+class OzonParcelView(APIView):
+    permission_classes = [IsOrderManager]
+
+    def post(self, request):
+        order_id = request.data.get("order_id")
+        city_id = str(request.data.get("city_id", "")).strip()
+        city_name = str(request.data.get("city_name", "")).strip()
+        if not city_id:
+            return Response({"city_id": "ID ville Ozon obligatoire."}, status=400)
+        order = Order.objects.prefetch_related("items").get(pk=order_id)
+        if order.tracking_number:
+            return Response({"detail": "Cette commande a deja un tracking number."}, status=400)
+        settings_value = ozon_settings().value or {}
+        customer_id = settings_value.get("customer_id")
+        api_key = settings_value.get("api_key")
+        if not customer_id or not api_key:
+            return Response({"detail": "Configurez Ozon customer ID et API key avant l'envoi."}, status=400)
+
+        parcel_nature = ", ".join(item.product_name for item in order.items.all())[:180] or f"Commande {order.order_number}"
+        payload = {
+            "parcel-receiver": order.shipping_full_name,
+            "parcel-phone": order.shipping_phone,
+            "parcel-city": city_id,
+            "parcel-address": order.shipping_address,
+            "parcel-note": order.customer_note or "",
+            "parcel-price": ozon_amount(order.total),
+            "parcel-nature": parcel_nature,
+            "parcel-stock": str(request.data.get("parcel_stock", "1")),
+            "parcel-open": str(request.data.get("parcel_open", "1")),
+            "parcel-fragile": str(request.data.get("parcel_fragile", "0")),
+            "parcel-replace": str(request.data.get("parcel_replace", "0")),
+            "products": json.dumps(ozon_order_products(order)),
+        }
+        tracking_number_override = str(request.data.get("tracking_number", "")).strip()
+        if tracking_number_override:
+            payload["tracking-number"] = tracking_number_override
+        url = f"https://api.ozonexpress.ma/customers/{customer_id}/{api_key}/add-parcel"
+        try:
+            multipart_payload = {key: (None, value) for key, value in payload.items()}
+            response = requests.post(url, files=multipart_payload, timeout=20)
+            if response.status_code >= 400:
+                return Response({"detail": "Ozon a refuse le colis.", "status_code": response.status_code, "ozon_response": response.text[:1000]}, status=502)
+            data = response.json()
+        except requests.RequestException as exc:
+            return Response({"detail": f"Ozon API indisponible: {exc}"}, status=502)
+        except ValueError:
+            return Response({"detail": "Reponse Ozon invalide."}, status=502)
+
+        tracking_number = find_ozon_tracking_number(data)
+        if not tracking_number:
+            return Response({"detail": f"Ozon n'a pas retourne de tracking number. Reponse: {json.dumps(data, ensure_ascii=False)[:800]}", "ozon_response": data}, status=502)
+        previous_status = order.status
+        order.tracking_number = tracking_number
+        if city_name:
+            order.shipping_city = city_name
+        if order.status in {Order.Status.PENDING, Order.Status.CONFIRMED, Order.Status.PREPARING}:
+            order.status = Order.Status.SHIPPED
+        order.save(update_fields=["tracking_number", "shipping_city", "status", "updated_at"])
+        if previous_status != order.status:
+            OrderStatusHistory.objects.create(order=order, from_status=previous_status, to_status=order.status, actor=request.user, note=f"Colis ajoute a Ozon: {tracking_number}")
+        AuditLog.objects.create(
+            actor=request.user,
+            action="OZON_PARCEL_CREATED",
+            entity="Order",
+            entity_id=str(order.pk),
+            after={"tracking_number": tracking_number, "city_id": city_id, "city_name": city_name},
+            ip_address=client_ip(request),
+        )
+        return Response({"order": OrderSerializer(order).data, "ozon": data})
+
+
+class OzonTrackingView(APIView):
+    permission_classes = [IsOrderManager]
+
+    def get(self, request):
+        qs = (
+            Order.objects.select_related("user", "delivery_zone")
+            .prefetch_related("items", "status_history")
+            .exclude(tracking_number="")
+            .order_by("-updated_at", "-created_at")[:200]
+        )
+        rows = OrderSerializer(qs, many=True).data
+        all_tracking = Order.objects.exclude(tracking_number="")
+        dashboard = {
+            "total": all_tracking.count(),
+            "shipped": all_tracking.filter(status=Order.Status.SHIPPED).count(),
+            "out_for_delivery": all_tracking.filter(status=Order.Status.OUT_FOR_DELIVERY).count(),
+            "delivered": all_tracking.filter(status=Order.Status.DELIVERED).count(),
+            "returned": all_tracking.filter(status=Order.Status.RETURNED).count(),
+            "cancelled": all_tracking.filter(status=Order.Status.CANCELLED).count(),
+            "open": all_tracking.exclude(status__in=[Order.Status.DELIVERED, Order.Status.CANCELLED, Order.Status.RETURNED, Order.Status.REFUNDED]).count(),
+        }
+        return Response({"dashboard": dashboard, "results": rows})
+
+
+class OzonTrackingSyncView(APIView):
+    permission_classes = [IsOrderManager]
+
+    def post(self, request):
+        order_ids = request.data.get("order_ids") or []
+        qs = Order.objects.exclude(tracking_number="")
+        if order_ids:
+            qs = qs.filter(id__in=order_ids)
+        else:
+            qs = qs.exclude(status__in=[Order.Status.DELIVERED, Order.Status.CANCELLED, Order.Status.RETURNED, Order.Status.REFUNDED])
+        orders = list(qs.order_by("-updated_at")[:200])
+        tracking_numbers = [order.tracking_number for order in orders if order.tracking_number]
+        if not tracking_numbers:
+            return Response({"detail": "Aucune commande avec tracking a synchroniser.", "updated": 0, "results": []})
+
+        settings_value = ozon_settings().value or {}
+        customer_id = settings_value.get("customer_id")
+        api_key = settings_value.get("api_key")
+        if not customer_id or not api_key:
+            return Response({"detail": "Configurez Ozon customer ID et API key avant le tracking."}, status=400)
+
+        url = f"https://api.ozonexpress.ma/customers/{customer_id}/{api_key}/tracking"
+        try:
+            response = requests.post(url, json={"tracking-number": tracking_numbers}, timeout=30)
+            if response.status_code >= 400:
+                return Response({"detail": "Ozon a refuse le tracking.", "status_code": response.status_code, "ozon_response": response.text[:1000]}, status=502)
+            data = response.json()
+        except requests.RequestException as exc:
+            return Response({"detail": f"Ozon tracking indisponible: {exc}"}, status=502)
+        except ValueError:
+            return Response({"detail": "Reponse tracking Ozon invalide."}, status=502)
+
+        rows_by_tracking = collect_ozon_tracking_rows(data)
+        updated = 0
+        results = []
+        for order in orders:
+            row = rows_by_tracking.get(order.tracking_number) or rows_by_tracking.get(order.tracking_number.upper()) or {}
+            ozon_status = ozon_status_from_payload(row)
+            next_status = order_status_from_ozon(ozon_status)
+            before = order.status
+            if next_status and next_status != order.status:
+                order.status = next_status
+                order.save(update_fields=["status", "updated_at"])
+                OrderStatusHistory.objects.create(order=order, from_status=before, to_status=next_status, actor=request.user, note=f"Ozon tracking: {ozon_status}")
+                updated += 1
+            results.append({"order_id": order.id, "order_number": order.order_number, "tracking_number": order.tracking_number, "ozon_status": ozon_status, "old_status": before, "new_status": order.status})
+        AuditLog.objects.create(actor=request.user, action="OZON_TRACKING_SYNCED", entity="Order", after={"count": len(orders), "updated": updated}, ip_address=client_ip(request))
+        return Response({"updated": updated, "results": results, "ozon": data})
+
+
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
     permission_classes = [IsOrderManagerOrCustomer]
@@ -1043,6 +1408,38 @@ class HomeSectionViewSet(viewsets.ModelViewSet):
         if section.products.exists():
             return Response({"detail": "Retirez tous les produits de cette section avant de la supprimer."}, status=400)
         return super().destroy(request, *args, **kwargs)
+
+
+class HomeDesignSettingsView(APIView):
+    permission_classes = [AllowAny]
+
+    def get_permissions(self):
+        if self.request.method in {"PATCH", "PUT"}:
+            return [IsDeveloper()]
+        return [AllowAny()]
+
+    def get(self, request):
+        _settings_row, value = home_design_settings()
+        return Response(value)
+
+    def patch(self, request):
+        settings_row, current = home_design_settings()
+        allowed = set(HOME_DESIGN_DEFAULTS)
+        cleaned = {}
+        for key, value in request.data.items():
+            if key in allowed:
+                cleaned[key] = str(value).strip()
+        settings_row.value = {**current, **cleaned}
+        settings_row.save(update_fields=["value", "updated_at"])
+        AuditLog.objects.create(
+            actor=request.user,
+            action="HOME_DESIGN_UPDATED",
+            entity="SiteSettings",
+            entity_id=str(settings_row.pk),
+            after=cleaned,
+            ip_address=client_ip(request),
+        )
+        return Response(settings_row.value)
 
 
 class NewsletterSubscribeView(APIView):
