@@ -239,7 +239,7 @@ def dolphin_invoice_pdf_response(order):
     line_width(0.7)
     stroke_color(0)
 
-    logo_path = settings.BASE_DIR.parent / "frontend" / "src" / "assets" / "dolphin-logo.jpeg"
+    logo_path = settings.BASE_DIR / "static" / "images" / "dolphin-logo.jpeg"    
     logo_data = None
     logo_size = None
     if logo_path.exists():
@@ -1047,11 +1047,9 @@ class OzonParcelView(APIView):
             return Response({"detail": f"Ozon n'a pas retourne de tracking number. Reponse: {json.dumps(data, ensure_ascii=False)[:800]}", "ozon_response": data}, status=502)
         previous_status = order.status
         order.tracking_number = tracking_number
-        if city_name:
-            order.shipping_city = city_name
         if order.status in {Order.Status.PENDING, Order.Status.CONFIRMED, Order.Status.PREPARING}:
             order.status = Order.Status.SHIPPED
-        order.save(update_fields=["tracking_number", "shipping_city", "status", "updated_at"])
+        order.save(update_fields=["tracking_number", "status", "updated_at"])
         if previous_status != order.status:
             OrderStatusHistory.objects.create(order=order, from_status=previous_status, to_status=order.status, actor=request.user, note=f"Colis ajoute a Ozon: {tracking_number}")
         AuditLog.objects.create(
@@ -1940,8 +1938,18 @@ class DeveloperAnalyticsView(APIView):
                     "delivered": len(delivered_ids),
                     "cancelled": len(cancelled_ids),
                     "confirmation_rate": round((len(confirmed_ids) / created_count * 100), 1) if created_count else 0,
-                    "delivery_rate": round((len(delivered_ids) / max(created_count - len(cancelled_ids), len(delivered_ids)) * 100), 1) if (created_count or delivered_ids) else 0,
-                    "cancel_rate": round((len(cancelled_ids) / created_count * 100), 1) if created_count else 0,
+"delivery_rate": round(
+    (
+        len(delivered_ids)
+        / max(
+            created_count - len(cancelled_ids),
+            len(delivered_ids),
+            1,
+        )
+        * 100
+    ),
+    1,
+),                    "cancel_rate": round((len(cancelled_ids) / created_count * 100), 1) if created_count else 0,
                     "avg_delivery_hours": avg_delivery_hours,
                     "delivered_revenue": delivered_revenue,
                 },

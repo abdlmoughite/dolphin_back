@@ -170,12 +170,25 @@ def checkout(user, cart, data):
     zone_id = data.get("delivery_zone_id")
     if zone_id:
         zone = DeliveryZone.objects.select_for_update().get(pk=zone_id, is_active=True)
+        if data["payment_method"] == Order.PaymentMethod.COD and not zone.cash_on_delivery_available:
+            raise ValidationError({"payment_method": "Paiement a la livraison indisponible dans cette ville."})
     else:
-        zone = DeliveryZone.objects.select_for_update().filter(is_active=True).order_by("city", "id").first()
-    if not zone:
-        zone = DeliveryZone.objects.create(city=data.get("shipping_city", "Autre") or "Autre", shipping_price=Decimal("0.00"), is_active=True)
-    if data["payment_method"] == Order.PaymentMethod.COD and not zone.cash_on_delivery_available:
-        raise ValidationError({"payment_method": "Paiement a la livraison indisponible dans cette ville."})
+        zone, _ = DeliveryZone.objects.select_for_update().get_or_create(
+            city="Autre",
+            defaults={"shipping_price": Decimal("0.00"), "is_active": True, "cash_on_delivery_available": True},
+        )
+        changed_fields = []
+        if not zone.is_active:
+            zone.is_active = True
+            changed_fields.append("is_active")
+        if not zone.cash_on_delivery_available:
+            zone.cash_on_delivery_available = True
+            changed_fields.append("cash_on_delivery_available")
+        if zone.shipping_price != Decimal("0.00"):
+            zone.shipping_price = Decimal("0.00")
+            changed_fields.append("shipping_price")
+        if changed_fields:
+            zone.save(update_fields=[*changed_fields, "updated_at"])
 
     address = None
     if data.get("address_id"):

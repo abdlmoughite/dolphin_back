@@ -2,6 +2,7 @@ import csv
 from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO, StringIO
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -13,7 +14,7 @@ from PIL import Image
 from rest_framework.test import APIClient
 
 from .importers.validators import TEMPLATE_COLUMNS
-from .models import AttributeValue, AuditLog, Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Expense, Inventory, NewsletterSubscriber, Order, OrderItem, Product, ProductImportJob, ProductImage, ProductVariant, Refund, ReturnItem, ReturnRequest, StockMovement, Supplier, SupportTicket
+from .models import AttributeValue, AuditLog, Brand, Cart, CartItem, Category, Coupon, DeliveryZone, Expense, Inventory, NewsletterSubscriber, Order, OrderItem, Product, ProductImportJob, ProductImage, ProductVariant, Refund, ReturnItem, ReturnRequest, SiteSettings, StockMovement, Supplier, SupportTicket
 from .views import find_ozon_tracking_number, order_status_from_ozon, normalize_ozon_cities
 
 
@@ -462,6 +463,62 @@ class CommerceApiTests(TestCase):
         self.assertEqual(response.data["shipping_city"], "casablanca")
         self.assertEqual(response.data["items"][0]["product_name"], product.name)
         self.assertEqual(response.data["items"][0]["variant"], None)
+
+    def test_checkout_accepts_arabic_customer_city_without_delivery_zones(self):
+        DeliveryZone.objects.all().delete()
+        headers = {"HTTP_X_SESSION_KEY": "arabic-city-checkout"}
+        response = self.client.post("/api/v1/cart/add/", {"variant_id": self.variant.id, "quantity": 1}, **headers)
+        self.assertEqual(response.status_code, 201, response.data)
+        arabic_city = "\u0627\u0644\u062f\u0627\u0631 \u0627\u0644\u0628\u064a\u0636\u0627\u0621"
+        response = self.client.post(
+            "/api/v1/checkout/",
+            {
+                "guest_email": "arabic-city@test.local",
+                "shipping_full_name": "Client Arabic",
+                "shipping_phone": "0665113076",
+                "shipping_address": "Rue test",
+                "shipping_city": arabic_city,
+                "payment_method": "COD",
+            },
+            **headers,
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["shipping_city"], arabic_city)
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertEqual(order.delivery_zone.city, "Autre")
+
+    def test_ozon_parcel_keeps_customer_city_when_admin_selects_ozon_city(self):
+        arabic_city = "\u0627\u0644\u062f\u0627\u0631 \u0627\u0644\u0628\u064a\u0636\u0627\u0621"
+        order = Order.objects.create(
+            user=self.customer,
+            payment_method=Order.PaymentMethod.COD,
+            delivery_zone=self.zone,
+            shipping_full_name="Client",
+            shipping_phone="+212612345678",
+            shipping_address="Adresse",
+            shipping_city=arabic_city,
+            subtotal=Decimal("100.00"),
+            shipping_total=Decimal("0.00"),
+            total=Decimal("100.00"),
+            status=Order.Status.CONFIRMED,
+        )
+        OrderItem.objects.create(order=order, product=self.product, variant=self.variant, product_name=self.product.name, sku=self.variant.sku, unit_price=Decimal("100.00"), quantity=1, total=Decimal("100.00"))
+        SiteSettings.objects.create(key="ozon", value={"customer_id": "cid", "api_key": "secret"})
+
+        class FakeOzonResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"ADD-PARCEL": {"RESULT": "SUCCESS", "NEW-PARCEL": {"TRACKING-NUMBER": "OZ123"}}}
+
+        self.login(self.admin)
+        with patch("commerce.views.requests.post", return_value=FakeOzonResponse()):
+            response = self.client.post("/api/v1/ozon/parcels/", {"order_id": order.id, "city_id": "45", "city_name": "Casablanca"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        order.refresh_from_db()
+        self.assertEqual(order.shipping_city, arabic_city)
+        self.assertEqual(order.tracking_number, "OZ123")
 
     def test_category_deactivation_keeps_order_history_and_reactivation_restores_products(self):
         order = Order.objects.create(
